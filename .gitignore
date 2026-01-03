@@ -1,0 +1,28 @@
+# Nim build artifacts
+nimcache/
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Compiled binaries (examples and tests)
+examples/ex[0-9]*[!.nim]
+tests/t_*[!.nim]
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE/Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Test results (generated)
+testresults/
+
+# Specify template files (not needed in release)
+.specify/
+.codex/
