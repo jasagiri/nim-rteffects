@@ -1,238 +1,122 @@
 # RTEffects
 
-A CPS (Continuation-Passing Style) based runtime effects library for Nim, providing structured concurrency, async operations, and powerful error handling.
+A runtime effects library for Nim with algebraic effects, 4-valued Belnap
+evaluation semantics, and a state machine VM.
 
 ## Requirements
 
 - Nim >= 2.3.0
+- [actor-state-machine](https://github.com/jasagiri/actor-state-machine) (sibling project)
+- [egison-patterns](https://github.com/jasagiri/egison-patterns) (transitive dependency)
 
-## Installation
+## Architecture
 
-Add to your `.nimble` file:
+RTEffects v2 replaces v1's CPS callback architecture with:
 
-```nim
-requires "rteffects"
+1. **Belnap 4-valued semantics** — `TruthValue {tvTrue, tvFalse, tvBoth, tvNeither}`
+   forming a De Morgan bilattice, enabling representation of contradictory and
+   undetermined evaluation states.
+
+2. **Algebraic effects** — `perform`/`handle` as the primary user API.
+   Effects are identified by `EffectTag` and handled by composable handlers.
+
+3. **State machine VM** — A defunctionalized continuation table (`EffProgram`)
+   interpreted by a frame-based engine with `StateMachine[FrameState, FrameEvent]`
+   lifecycle management.
+
+### 3-Tier API Visibility
+
 ```
-
-Or install directly:
-
-```bash
-nimble install rteffects
+Tier 1 (App developer):  Eff[T], pure, andThen, map, perform, handle
+Tier 2 (Handler author): + TruthValue, Eval[T], BoxedValue, resume/abort
+Tier 3 (Runner):         run() → Result[T]  (the only 2-valued boundary)
 ```
 
 ## Quick Start
 
 ```nim
-import std/times
-import rteffects
+import rteffects/core
+import rteffects/algebra
+import rteffects/vm/types
+import rteffects/vm/engine
 
-# Define a task using the .rt. macro
-proc fetchData(): Task[string] {.rt.} =
-  perform sleep(100.milliseconds)
-  return "Hello, RTEffects!"
+# Pure computation
+let result = run[int](pure[int](42))
+assert result.isOk
+assert result.ok == 42
 
-# Run the task
-let result = runDefault(fetchData())
-if result.isOk:
-  echo result.ok  # "Hello, RTEffects!"
-else:
-  echo "Error: ", result.err.msg
+# Chained computation (monadic bind)
+let eff = pure[int](1)
+  .andThen(proc(x: int): Eff[int] {.gcsafe.} = pure[int](x + 1))
+  .andThen(proc(x: int): Eff[int] {.gcsafe.} = pure[int](x * 10))
+let result2 = run[int](eff)
+assert result2.isOk
+assert result2.ok == 20
+
+# Effect handling
+let tag = EffectTag("double")
+let body = perform[int](tag, boxInt(21))
+let handled = body.handle(tag, proc(payload: BoxedValue,
+    resume: proc(v: BoxedValue) {.gcsafe.},
+    abort: proc(e: RtError) {.gcsafe.}) {.gcsafe.} =
+  resume(boxInt(unboxInt(payload) * 2))
+)
+let result3 = run[int](handled)
+assert result3.isOk
+assert result3.ok == 42
 ```
 
-## Core Concepts
+## Module Structure
 
-### Tasks
-
-A `Task[T]` represents an asynchronous computation that produces a value of type `T`. Tasks are lazy - they don't execute until run.
-
-### The .rt. Macro
-
-The `.rt.` pragma transforms a proc into a CPS-style task. Inside `.rt.` procs:
-
-- `await` - Wait for another task and get its result
-- `perform` - Execute an effect (like `sleep`)
-- `return` - Return a value
-
-```nim
-proc myTask(): Task[int] {.rt.} =
-  let data = await fetchFromNetwork()
-  perform sleep(100.milliseconds)
-  return data.len
+```
+src/rteffects/
+├── core.nim          # RtError, Result[T], TaskId (shared kernel)
+├── semantics.nim     # TruthValue, Eval[T], Belnap lattice operations
+├── algebra.nim       # Eff[T], pure, andThen, map, perform, handle
+└── vm/
+    ├── types.nim     # EffOp, EffProgram, ContId, BoxedValue, EffectTag
+    └── engine.nim    # Frame, Engine, interpret, run (includes runner ACL)
 ```
 
-### Structured Concurrency with Nurseries
+## Core Types
 
-Nurseries ensure all child tasks complete before the parent continues:
+### Effect Algebra (Tier 1)
 
-```nim
-proc parent(): Task[Unit] =
-  nursery(proc(n: Nursery): Task[Unit] {.gcsafe, closure.} =
-    andThen(spawnChild(n, childTask1()), proc(_: TaskId): Task[Unit] {.gcsafe, closure.} =
-      andThen(spawnChild(n, childTask2()), proc(_: TaskId): Task[Unit] {.gcsafe, closure.} =
-        pure(unit())
-      )
-    )
-  )
-```
+- `Eff[T]` — A description of an effectful computation producing `T`. Lazy.
+- `EffectTag` — Distinct string identifying an effect for handler dispatch.
+- `BoxedValue` — Type-erased value (variant: int, string, float, bool, ref, program).
 
-### Error Handling
+### Evaluation Semantics (Tier 2)
 
-```nim
-proc withRecovery(): Task[string] =
-  let task = riskyOperation()
-  recover(task, proc(e: RtError): Task[string] {.gcsafe, closure.} =
-    pure("fallback value")
-  )
-```
+- `TruthValue` — `{tvTrue, tvFalse, tvBoth, tvNeither}` with lattice operations.
+- `Eval[T]` — Computation result with 4-valued truth, value, and error.
+- `join`, `meet`, `negate`, `leqI` — Belnap lattice operations.
 
-### Parallel Execution
+### Runner (Tier 3)
 
-```nim
-# Run all tasks in parallel
-let results = runDefault(all(@[task1(), task2(), task3()]))
-
-# Race - get first result
-let fastest = runDefault(race(@[slowTask(), fastTask()]))
-```
-
-### Timeouts
-
-```nim
-let result = runDefault(withTimeout(5.seconds, longRunningTask()))
-if result.isErr and result.err.kind == Timeout:
-  echo "Operation timed out"
-```
-
-## Examples
-
-The `examples/` directory contains comprehensive examples:
-
-| Example | Description |
-|---------|-------------|
-| [ex01_hello_world.nim](examples/ex01_hello_world.nim) | Basic task creation and execution |
-| [ex02_async_sleep.nim](examples/ex02_async_sleep.nim) | Using sleep and perform |
-| [ex03_spawn_join.nim](examples/ex03_spawn_join.nim) | Spawning and joining child tasks |
-| [ex04_error_handling.nim](examples/ex04_error_handling.nim) | Error recovery and chaining |
-| [ex05_timeout.nim](examples/ex05_timeout.nim) | Timeout patterns |
-| [ex06_retry.nim](examples/ex06_retry.nim) | Retry with backoff |
-| [ex07_parallel.nim](examples/ex07_parallel.nim) | Parallel execution (all, race, allSettled) |
-| [ex08_nursery.nim](examples/ex08_nursery.nim) | Structured concurrency |
-| [ex09_channels.nim](examples/ex09_channels.nim) | Channel-based communication |
-| [ex10_sync.nim](examples/ex10_sync.nim) | Semaphore and Mutex |
-| [ex11_resource.nim](examples/ex11_resource.nim) | Resource management (bracket) |
-| [ex12_worker_pool.nim](examples/ex12_worker_pool.nim) | Worker pool pattern |
-| [ex13_rate_limiter.nim](examples/ex13_rate_limiter.nim) | Rate limiting |
-| [ex14_pipeline.nim](examples/ex14_pipeline.nim) | Data processing pipeline |
-| [ex15_cancellation.nim](examples/ex15_cancellation.nim) | Task cancellation |
-| [ex16_asyncdispatch_interop.nim](examples/ex16_asyncdispatch_interop.nim) | AsyncDispatch integration |
-
-Run an example:
-
-```bash
-nim c -r examples/ex01_hello_world.nim
-```
-
-## Documentation
-
-- [Getting Started](docs/getting_started.md) - Introduction and basic concepts
-- [API Reference](docs/api_reference.md) - Complete API documentation
-- [Patterns & Best Practices](docs/patterns.md) - Common patterns and tips
-
-## API Overview
-
-### Core Types
-
-- `Task[T]` - Async computation producing `T`
-- `Result[T]` - Success value or error
-- `RtError` - Error with kind, message, and optional cause chain
-- `Unit` - Void-like type for `Task[Unit]`
-
-### Running Tasks
-
-```nim
-runDefault(task)           # Run to completion, return Result[T]
-runDefaultWithTrace(task)  # Run with tracing support
-start(task)                # Start task, return TaskId
-```
-
-### Combinators
-
-```nim
-andThen(task, f)    # Chain tasks (flatMap)
-map(task, f)        # Transform successful result
-recover(task, f)    # Recover from errors
-ensure(task, fin)   # Always run finalizer
-```
-
-### Parallel Execution
-
-```nim
-all(tasks)          # Run all, fail fast
-allSettled(tasks)   # Run all, collect results
-race(tasks)         # First to complete wins
-```
-
-### Synchronization
-
-```nim
-newSemaphore(n)     # Limit concurrency
-newMutex()          # Mutual exclusion
-newTaskChannel[T]() # Inter-task communication
-```
-
-### Resource Management
-
-```nim
-bracket(acquire, use, release)  # Safe resource handling
-```
-
-## Guidelines
-
-- Use `Task[Unit]` for void-like effects and returns
-- Use `unit()` to construct a value for `Task[Unit]`
-- Always mark closures with `{.gcsafe, closure.}`
-- Use `perform sleep()` instead of stdlib `sleep()` inside tasks
-- Handle errors using `recover`, `catchError`, or check `Result.isOk`
+- `run[T](eff): Result[T]` — Interpret and collapse to 2-valued result.
+- `interpret[T](eff): Eval[T]` — Interpret without collapsing.
 
 ## Running Tests
 
 ```bash
-# Run all tests
-./build_all.sh
-
-# Run specific test
-nim c -r tests/t_rteffects.nim
-nim c -r tests/t_spec.nim
-nim c -r tests/t_new_features.nim
+# Individual test files
+nim c -r tests/t_engine.nim
+nim c -r tests/t_semantics.nim
+nim c -r tests/t_eval.nim
+nim c -r tests/t_vm_types.nim
+nim c -r tests/t_algebra.nim
 ```
 
-## CI with Coverage
+## Design Documents
 
-```bash
-scripts/ci/run_testament_gcov.sh
-```
-
-Example GitHub Actions:
-
-```yaml
-name: CI
-on: [push, pull_request]
-jobs:
-  test:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: iffy/install-nim@v5
-        with:
-          version: "2.3.1"
-      - run: sudo apt-get update && sudo apt-get install -y lcov
-      - run: scripts/ci/run_testament_gcov.sh
-      - uses: actions/upload-artifact@v4
-        with:
-          name: coverage-html
-          path: coverage/html
-```
+- [RFC-0001: Overview](docs/rfcs/RFC-0001-overview.md)
+- [ADR-001: Belnap 4-valued Semantics](docs/rfcs/ADR-001-belnap-semantics.md)
+- [ADR-002: State Machine VM](docs/rfcs/ADR-002-state-machine-vm.md)
+- [ADR-003: Algebraic Effects](docs/rfcs/ADR-003-algebraic-effects.md)
+- [ADR-004: 3-Tier API Visibility](docs/rfcs/ADR-004-layered-api.md)
+- [ADR-005: Module Boundaries](docs/rfcs/ADR-005-module-boundaries.md)
 
 ## License
 
-MIT
+Apache-2.0
