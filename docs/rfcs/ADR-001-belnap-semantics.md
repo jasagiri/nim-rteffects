@@ -64,9 +64,14 @@ The four values form a De Morgan lattice with two orderings:
 
 | Operation | Definition | Property |
 |-----------|-----------|----------|
-| `join(a, b)` | Least upper bound in ≤_i | Commutative, associative, idempotent |
-| `meet(a, b)` | Greatest lower bound in ≤_i | Commutative, associative, idempotent |
-| `negate(a)` | De Morgan negation | negate(negate(a)) = a |
+| `join(a, b)` | Least upper bound in ≤_k | Commutative, associative, idempotent |
+| `meet(a, b)` | Greatest lower bound in ≤_k | Commutative, associative, idempotent |
+| `negate(a)` | Logical negation (T↔F, B→B, N→N) | Involution: negate(negate(a)) = a |
+
+Note: `negate` is the **logical** negation. De Morgan laws hold for truth ordering
+operations (∨, ∧), NOT for information ordering operations (join, meet). This is a
+fundamental property of Belnap's bilattice FOUR. Absorption laws hold for both:
+`join(a, meet(a, b)) == a` and `meet(a, join(a, b)) == a`.
 
 **Join table**:
 
