@@ -5,3 +5,4 @@ license = "Apatche-2.0"
 srcDir = "src"
 
 requires "nim >= 2.3.0"
+requires "actor_state_machine >= 0.1.0"

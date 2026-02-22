@@ -8,17 +8,29 @@
 ## op (opMap, opBind, opHandle) dispatches to a sub-expression, it pushes
 ## its own ContId onto contStack. Terminal ops (opPure, opFail) and
 ## completed compound ops pop contStack to return to the parent.
+##
+## Frame state transitions are managed by actor-state-machine's
+## StateMachine[FrameState, FrameEvent], providing validation,
+## history tracking, metrics, and observer support.
 
 import std/[tables, deques]
 import ../core
 import ../semantics
 import ./types
+import state_machine
 
 type
   FrameId* = distinct int
 
   FrameState* = enum
     fsReady, fsRunning, fsSuspended, fsDone
+
+  FrameEvent* = enum
+    evDequeue   ## Ready → Running: frame dequeued for execution
+    evYield     ## Running → Ready: needs more steps, re-enqueue
+    evComplete  ## Running → Done: computation finished
+    evSuspend   ## Running → Suspended: blocked on effect
+    evResume    ## Suspended → Ready: effect handler called resume
 
   HandlerEntry* = object
     tag*: EffectTag
@@ -30,7 +42,7 @@ type
     id*: FrameId
     pc*: ContId
     program*: EffProgram
-    state*: FrameState
+    sm*: StateMachine[FrameState, FrameEvent]
     result*: BoxedValue
     hasResult*: bool
     failed*: bool
@@ -46,6 +58,19 @@ type
 
 proc `==`*(a, b: FrameId): bool {.borrow.}
 
+proc state*(frame: Frame): FrameState =
+  ## Current state derived from the state machine.
+  frame.sm.getState()
+
+proc newFrameSM*(): StateMachine[FrameState, FrameEvent] =
+  ## Create a state machine governing Frame lifecycle transitions.
+  result = newStateMachine[FrameState, FrameEvent](fsReady)
+  result.addTransition(fsReady, evDequeue, fsRunning)
+  result.addTransition(fsRunning, evYield, fsReady)
+  result.addTransition(fsRunning, evComplete, fsDone)
+  result.addTransition(fsRunning, evSuspend, fsSuspended)
+  result.addTransition(fsSuspended, evResume, fsReady)
+
 proc newEngine*(budget = 1000): Engine =
   Engine(
     frames: initTable[int, Frame](),
@@ -54,14 +79,14 @@ proc newEngine*(budget = 1000): Engine =
     budget: budget,
   )
 
-proc newFrame(engine: Engine, program: EffProgram, entry: ContId): int =
+proc newFrame*(engine: Engine, program: EffProgram, entry: ContId): int =
   let id = engine.nextId
   engine.nextId += 1
   engine.frames[id] = Frame(
     id: FrameId(id),
     pc: entry,
     program: program,
-    state: fsReady,
+    sm: newFrameSM(),
     hasResult: false,
     failed: false,
   )
@@ -79,10 +104,10 @@ proc completeOrReturn(engine: Engine, frame: var Frame, frameId: int) =
   ## After producing a result (or error), return to parent op or mark done.
   if frame.contStack.len > 0:
     frame.pc = frame.contStack.pop()
-    frame.state = fsReady
+    discard frame.sm.handleEvent(evYield)
     engine.readyQ.addLast(frameId)
   else:
-    frame.state = fsDone
+    discard frame.sm.handleEvent(evComplete)
 
 # Forward declaration for mutual recursion
 proc interpretStep(engine: Engine, program: EffProgram, entry: ContId): tuple[hasResult: bool, result: BoxedValue, failed: bool, error: RtError]
@@ -97,7 +122,7 @@ proc step(engine: Engine): bool =
     return true
 
   var frame = engine.frames[frameId]
-  frame.state = fsRunning
+  discard frame.sm.handleEvent(evDequeue)
 
   let op = frame.program.ops[frame.pc.int]
 
@@ -127,14 +152,14 @@ proc step(engine: Engine): bool =
         elif inner.hasResult:
           frame.result = inner.result
           # Re-visit this opBind with the resolved value
-          frame.state = fsReady
+          discard frame.sm.handleEvent(evYield)
           engine.readyQ.addLast(frameId)
         else:
-          frame.state = fsSuspended
+          discard frame.sm.handleEvent(evSuspend)
       else:
         # Plain value — move to next phase (tail position, no push)
         frame.pc = op.bindNext
-        frame.state = fsReady
+        discard frame.sm.handleEvent(evYield)
         engine.readyQ.addLast(frameId)
     elif frame.failed:
       # Source failed, short-circuit
@@ -143,7 +168,7 @@ proc step(engine: Engine): bool =
       # First visit: evaluate source, remember to come back
       frame.contStack.add(frame.pc)
       frame.pc = op.bindSource
-      frame.state = fsReady
+      discard frame.sm.handleEvent(evYield)
       engine.readyQ.addLast(frameId)
 
   of opMap:
@@ -157,7 +182,7 @@ proc step(engine: Engine): bool =
       # Evaluate target first, remember to come back
       frame.contStack.add(frame.pc)
       frame.pc = op.mapTarget
-      frame.state = fsReady
+      discard frame.sm.handleEvent(evYield)
       engine.readyQ.addLast(frameId)
 
   of opPerform:
@@ -195,7 +220,7 @@ proc step(engine: Engine): bool =
         completeOrReturn(engine, frame, frameId)
       else:
         # Suspended (neither resume nor abort called)
-        frame.state = fsSuspended
+        discard frame.sm.handleEvent(evSuspend)
 
   of opHandle:
     if frame.hasResult or frame.failed:
@@ -209,13 +234,13 @@ proc step(engine: Engine): bool =
       ))
       frame.contStack.add(frame.pc)
       frame.pc = op.handleBody
-      frame.state = fsReady
+      discard frame.sm.handleEvent(evYield)
       engine.readyQ.addLast(frameId)
 
   engine.frames[frameId] = frame
   return true
 
-proc runLoop(engine: Engine) =
+proc runLoop*(engine: Engine) =
   ## Execute until no more work or budget exhausted.
   var steps = 0
   while engine.readyQ.len > 0 and steps < engine.budget:
@@ -223,7 +248,7 @@ proc runLoop(engine: Engine) =
       break
     steps += 1
 
-proc interpretProgram(engine: Engine, program: EffProgram, entry: ContId): tuple[hasResult: bool, result: BoxedValue, failed: bool, error: RtError] =
+proc interpretProgram*(engine: Engine, program: EffProgram, entry: ContId): tuple[hasResult: bool, result: BoxedValue, failed: bool, error: RtError] =
   let frameId = engine.newFrame(program, entry)
   engine.runLoop()
 
