@@ -2,7 +2,12 @@
 
 ## Status
 
-Accepted
+Accepted (partially superseded by ADR-006)
+
+**Note**: The defunctionalized continuation table and Frame/Engine architecture
+remain as designed. The `StateMachine[FrameState, FrameEvent]` integration for
+frame state management has been replaced with a lightweight enum — see ADR-006
+for rationale and performance data.
 
 ## Context
 
@@ -102,9 +107,8 @@ type
 ### Frame: Execution State
 
 Each running computation has a Frame tracking its position in the program.
-State transitions are governed by `StateMachine[FrameState, FrameEvent]`
-from the `actor-state-machine` library, providing validated transitions,
-history tracking, metrics, and observer support:
+State transitions use direct enum assignment via an inline `transition` proc
+(see ADR-006 for the migration from `StateMachine`):
 
 ```nim
 type
@@ -113,42 +117,39 @@ type
   FrameState* = enum
     fsReady, fsRunning, fsSuspended, fsDone
 
-  FrameEvent* = enum
-    evDequeue   ## Ready -> Running: frame dequeued for execution
-    evYield     ## Running -> Ready: needs more steps, re-enqueue
-    evComplete  ## Running -> Done: computation finished
-    evSuspend   ## Running -> Suspended: blocked on effect
-    evResume    ## Suspended -> Ready: effect handler called resume
-
   HandlerEntry* = object
     tag*: EffectTag
     impl*: proc(payload: BoxedValue,
                 resume: proc(v: BoxedValue) {.gcsafe.},
                 abort: proc(e: RtError) {.gcsafe.}) {.gcsafe, closure.}
 
+  when defined(rteffectsDebug):
+    type TransitionRecord* = object
+      fromState*, toState*: FrameState
+
   Frame* = object
     id*: FrameId
     pc*: ContId
     program*: EffProgram
-    sm*: StateMachine[FrameState, FrameEvent]
+    state*: FrameState
     result*: BoxedValue
     hasResult*: bool
     failed*: bool
     error*: RtError
     handlers*: seq[HandlerEntry]
     contStack*: seq[ContId]  ## Return address stack
+    when defined(rteffectsDebug):
+      transitions*: seq[TransitionRecord]
 ```
 
-The state machine is initialized with explicit transition rules:
+State transitions are inlined with optional debug recording:
 
 ```nim
-proc newFrameSM*(): StateMachine[FrameState, FrameEvent] =
-  result = newStateMachine[FrameState, FrameEvent](fsReady)
-  result.addTransition(fsReady, evDequeue, fsRunning)
-  result.addTransition(fsRunning, evYield, fsReady)
-  result.addTransition(fsRunning, evComplete, fsDone)
-  result.addTransition(fsRunning, evSuspend, fsSuspended)
-  result.addTransition(fsSuspended, evResume, fsReady)
+proc transition(frame: var Frame, to: FrameState) {.inline.} =
+  when defined(rteffectsDebug):
+    frame.transitions.add(TransitionRecord(
+      fromState: frame.state, toState: to))
+  frame.state = to
 ```
 
 ### contStack: Return Address Mechanism
@@ -162,25 +163,26 @@ Compound ops (`opBind`, `opMap`, `opHandle`) push their own `ContId` onto
 proc completeOrReturn(engine: Engine, frame: var Frame, frameId: int) =
   if frame.contStack.len > 0:
     frame.pc = frame.contStack.pop()
-    discard frame.sm.handleEvent(evYield)
-    engine.readyQ.addLast(frameId)
+    frame.transition(fsReady)
+    engine.enqueue(frameId)
   else:
-    discard frame.sm.handleEvent(evComplete)
+    frame.transition(fsDone)
 ```
 
 This replaces the parent-child frame model. All execution happens within a
 single frame using the `contStack` as an intra-frame call stack.
 
-### Engine: State Machine Loop
+### Engine: Stepping Loop
 
 The engine dequeues ready frames and executes one instruction per step.
-State transitions use SM events instead of direct state assignment:
+Frames are accessed in place via a template to avoid copying (ADR-006).
+State transitions use direct enum assignment:
 
 ```nim
 proc step(engine: Engine): bool =
-  let frameId = engine.readyQ.popFirst()
-  var frame = engine.frames[frameId]
-  discard frame.sm.handleEvent(evDequeue)  # Ready -> Running
+  let frameId = engine.dequeue()
+  template frame: untyped = engine.frames[frameId]  # in-place access
+  frame.transition(fsRunning)
 
   let op = frame.program.ops[frame.pc.int]
   case op.kind
@@ -189,92 +191,34 @@ proc step(engine: Engine): bool =
     frame.hasResult = true
     completeOrReturn(engine, frame, frameId)
 
-  of opFail:
-    frame.error = op.failError
-    frame.failed = true
-    completeOrReturn(engine, frame, frameId)
-
   of opBind:
     if frame.hasResult:
       if frame.result.kind == bvProgram:
-        # Resolve nested program from andThen
-        let inner = engine.interpretStep(
-          frame.result.innerProgram, frame.result.innerProgram.entry)
-        if inner.failed:
-          frame.error = inner.error
-          frame.failed = true
-          frame.hasResult = false
-          completeOrReturn(engine, frame, frameId)
-        elif inner.hasResult:
-          frame.result = inner.result
-          discard frame.sm.handleEvent(evYield)
-          engine.readyQ.addLast(frameId)
+        # Fast-resolve trivial inner programs inline (ADR-006)
+        let innerOp = frame.result.innerProgram.ops[innerEntry]
+        case innerOp.kind
+        of opPure:
+          frame.result = innerOp.pureValue
+          frame.transition(fsReady)
+          engine.enqueue(frameId)
         else:
-          discard frame.sm.handleEvent(evSuspend)
+          # Fallback to full interpretStep for complex inner programs
+          let inner = engine.interpretStep(innerProg, innerProg.entry)
+          # ...
       else:
         frame.pc = op.bindNext
-        discard frame.sm.handleEvent(evYield)
-        engine.readyQ.addLast(frameId)
-    elif frame.failed:
-      completeOrReturn(engine, frame, frameId)
-    else:
-      frame.contStack.add(frame.pc)
-      frame.pc = op.bindSource
-      discard frame.sm.handleEvent(evYield)
-      engine.readyQ.addLast(frameId)
+        frame.transition(fsReady)
+        engine.enqueue(frameId)
+    # ... (fail short-circuit, first visit)
 
   of opPerform:
-    let idx = findHandler(frame, op.performTag)
-    if idx < 0:
-      frame.error = RtError(kind: ForeignError,
-        msg: "unhandled effect: " & $op.performTag)
-      frame.failed = true
-      completeOrReturn(engine, frame, frameId)
-    else:
-      var resumed = false
-      var resumeValue: BoxedValue
-      var aborted = false
-      var abortError: RtError
-      frame.handlers[idx].impl(
-        op.performPayload,
-        proc(v: BoxedValue) {.gcsafe.} =
-          resumed = true; resumeValue = v,
-        proc(e: RtError) {.gcsafe.} =
-          aborted = true; abortError = e,
-      )
-      if resumed:
-        frame.result = resumeValue
-        frame.hasResult = true
-        completeOrReturn(engine, frame, frameId)
-      elif aborted:
-        frame.error = abortError
-        frame.failed = true
-        completeOrReturn(engine, frame, frameId)
-      else:
-        discard frame.sm.handleEvent(evSuspend)
+    # ... handler dispatch with resume/abort closures
 
   of opHandle:
-    if frame.hasResult or frame.failed:
-      completeOrReturn(engine, frame, frameId)
-    else:
-      frame.handlers.add(HandlerEntry(
-        tag: op.handleTag, impl: op.handleImpl))
-      frame.contStack.add(frame.pc)
-      frame.pc = op.handleBody
-      discard frame.sm.handleEvent(evYield)
-      engine.readyQ.addLast(frameId)
+    # ... install handler and evaluate body
 
   of opMap:
-    if frame.hasResult:
-      frame.result = op.mapFn(frame.result)
-      completeOrReturn(engine, frame, frameId)
-    elif frame.failed:
-      completeOrReturn(engine, frame, frameId)
-    else:
-      frame.contStack.add(frame.pc)
-      frame.pc = op.mapTarget
-      discard frame.sm.handleEvent(evYield)
-      engine.readyQ.addLast(frameId)
+    # ... apply transform function
 ```
 
 ### Handler Signature
@@ -323,7 +267,11 @@ in the variant, avoiding allocation. The `bvRef` branch preserves `RootRef`
 as an escape hatch. The `bvProgram` branch enables monadic composition without
 a separate mechanism.
 
-### Why SM events over direct state assignment
+### Why SM events over direct state assignment (superseded by ADR-006)
+
+> **Note**: This section describes the original rationale. ADR-006 replaced the
+> StateMachine with direct enum assignment after benchmarking showed 57% overhead.
+> Debug history is available via `-d:rteffectsDebug`.
 
 Using `StateMachine[FrameState, FrameEvent]` provides:
 - **Validated transitions**: invalid transitions (e.g., `fsDone -> fsRunning`)
@@ -340,9 +288,10 @@ Using `StateMachine[FrameState, FrameEvent]` provides:
 - Frame suspension/resumption is natural (save/restore pc + contStack)
 - Budget-based preemption works by counting steps, not estimating closure depth
 - Handler dispatch walks a data structure, not a closure chain
-- Memory layout is cache-friendly (sequential ops in seq)
+- Memory layout is cache-friendly (sequential ops in seq, frames in seq)
 - BoxedValue avoids heap allocation for primitive types
-- State machine validates all frame transitions at runtime
+- Fast-path interpretation bypasses Engine for trivial programs (ADR-006)
+- Inline bvProgram resolution avoids frame creation for andThen chains (ADR-006)
 - `bvProgram` enables recursive program resolution for monadic bind
 
 ### Negative
@@ -424,32 +373,38 @@ EffProgram(
 For `pure(1).andThen(x => pure(x + 1))`:
 
 ```
-step 1: dequeue frame, evDequeue (Ready -> Running)
+step 1: dequeue frame, transition(fsRunning)
          pc=2 (opBind), first visit -> push ContId(2) onto contStack
-         set pc=0 (bindSource), evYield (Running -> Ready)
+         set pc=0 (bindSource), transition(fsReady), enqueue
 
-step 2: dequeue frame, evDequeue (Ready -> Running)
+step 2: dequeue frame, transition(fsRunning)
          pc=0 (opPure), result=boxInt(1), hasResult=true
-         contStack.pop -> pc=2, evYield (Running -> Ready)
+         completeOrReturn: contStack.pop -> pc=2, transition(fsReady), enqueue
 
-step 3: dequeue frame, evDequeue (Ready -> Running)
-         pc=2 (opBind), hasResult=true, plain value
-         set pc=1 (bindNext), evYield (Running -> Ready)
+step 3: dequeue frame, transition(fsRunning)
+         pc=2 (opBind), hasResult=true, plain value (bvInt)
+         set pc=1 (bindNext), transition(fsReady), enqueue
 
-step 4: dequeue frame, evDequeue (Ready -> Running)
-         pc=1 (opMap), first visit -> push ContId(1) onto contStack
-         set pc=0 (mapTarget), evYield (Running -> Ready)
-
-step 5: dequeue frame, evDequeue (Ready -> Running)
-         pc=0 (opPure), result=boxInt(1), hasResult=true
-         contStack.pop -> pc=1, evYield (Running -> Ready)
-
-step 6: dequeue frame, evDequeue (Ready -> Running)
+step 4: dequeue frame, transition(fsRunning)
          pc=1 (opMap), hasResult=true -> apply mapFn
-         result=BoxedValue(kind: bvProgram, ...)
-         contStack empty -> evComplete (Running -> Done)
+         result=BoxedValue(kind: bvProgram, innerProgram=pure(2))
+         completeOrReturn: contStack has ContId(2) -> pop, transition(fsReady)
 
-step 7: engine detects bvProgram, calls interpretStep recursively
-         inner program: pure(2) -> result=boxInt(2)
+step 5: dequeue frame, transition(fsRunning)
+         pc=2 (opBind), hasResult=true, result=bvProgram
+         fast-resolve: inner entry is opPure -> result=boxInt(2) (ADR-006)
+         transition(fsReady), enqueue
+
+step 6: dequeue frame, transition(fsRunning)
+         pc=2 (opBind), hasResult=true, result=bvInt(2) (plain value)
+         set pc=1 (bindNext), transition(fsReady), enqueue
+
+step 7: dequeue frame, transition(fsRunning)
+         pc=1 (opMap), hasResult=true -> apply mapFn (identity after resolve)
+         completeOrReturn: contStack empty -> transition(fsDone)
          final result: boxInt(2)
 ```
+
+Note: steps 4-5 demonstrate inline bvProgram resolution (ADR-006). Without
+this optimization, step 5 would create a new frame and run interpretStep
+recursively for the inner `pure(2)` program.

@@ -1,559 +1,511 @@
-# RTEffects API Reference
+# RTEffects v2 API Reference
 
-## Core Types
+This document covers the public API of RTEffects v2. The library is organized into four tiers based on audience. Most application code only needs Tier 1.
 
-### Task[T]
+---
+
+## Tier 1: App Developer API
+
+Import paths: `rteffects/core`, `rteffects/algebra`
+
+### `Eff[T]`
 
 ```nim
-type Task*[T] = proc(rt: ptr Runtime, k: Cont[T])
+type Eff*[T] = ref object of EffBase
+  boxer*:   proc(v: T): BoxedValue {.gcsafe.}
+  unboxer*: proc(v: BoxedValue): T {.gcsafe.}
 ```
 
-Represents an asynchronous computation that produces a value of type `T`.
+The primary computation type. Represents an effectful program that, when run, produces a value of type `T` or fails with an `RtError`. Values are composed with `andThen` and `map`; effects are introduced with `perform` and handled with `handle`.
 
-### Result[T]
+---
+
+### Constructors
+
+#### `pure`
+
+```nim
+proc pure*[T](v: T): Eff[T]
+```
+
+Lifts a pure value into `Eff`. Equivalent to `return` in a monad. Never fails.
+
+#### `fail`
+
+```nim
+proc fail*[T](e: RtError): Eff[T]
+```
+
+Creates an immediately-failing `Eff` carrying the given error.
+
+---
+
+### Composition
+
+#### `andThen`
+
+```nim
+proc andThen*[T, U](eff: Eff[T], f: proc(v: T): Eff[U] {.gcsafe.}): Eff[U]
+```
+
+Sequences two effects. Calls `f` with the result of `eff` only if `eff` succeeds. Propagates failure without calling `f`.
+
+#### `map`
+
+```nim
+proc map*[T, U](eff: Eff[T], f: proc(v: T): U {.gcsafe.}): Eff[U]
+```
+
+Transforms the success value of `eff` with a pure function `f`. Does not affect the error path.
+
+---
+
+### Runner
+
+#### `run`
+
+```nim
+proc run*[T](eff: Eff[T], budget = 10000): Result[T] {.raises: [].}
+```
+
+Executes the effect program to completion and collapses the result to `Result[T]`. The `budget` parameter caps the number of VM reduction steps; exceed it and the result is an `Incomplete` error. Does not raise; all errors are captured in the returned `Result`.
+
+---
+
+### `Result[T]`
 
 ```nim
 type Result*[T] = object
   isOk*: bool
-  ok*: T
-  err*: RtError
+  ok*:   T
+  err*:  RtError
 ```
 
-Represents either a successful value or an error.
+Tagged union returned by `run`. Check `isOk` before accessing `ok` or `err`.
 
-### RtError
+---
+
+### `RtError`
 
 ```nim
 type RtError* = object
-  kind*: RtErrorKind
-  msg*: string
-  cause*: ref RtError       # Optional cause for error chaining
-  stackTrace*: string       # Optional stack trace
-  children*: seq[RtError]   # For AggregateError
+  kind*:       RtErrorKind
+  msg*:        string
+  cause*:      ref RtError    # optional chained cause
+  stackTrace*: string         # optional capture
+  children*:   seq[RtError]   # populated for AggregateError
 ```
 
-### RtErrorKind
+Structured error value. Carried through the `Eff` monad without stack unwinding.
+
+---
+
+### `RtErrorKind`
 
 ```nim
 type RtErrorKind* = enum
-  Timeout,
-  Cancelled,
-  ExceptionRaised,
-  ForeignError,
+  Timeout
+  Cancelled
+  ExceptionRaised
+  ForeignError
   AggregateError
+  Contradiction   # tvBoth semantics: value and error both present
+  Incomplete      # VM budget exhausted
 ```
 
-### TaskId / TypedTaskId[T]
+Discriminant for `RtError`. Use in `case` expressions to route error handling.
+
+---
+
+### Error Constructors
+
+Convenience constructors from `rteffects/core`:
 
 ```nim
-type TaskId* = distinct int
+proc cancelledError*(): RtError
+```
+Creates a `Cancelled` error.
+
+```nim
+proc timeoutError*(): RtError
+```
+Creates a `Timeout` error.
+
+```nim
+proc exceptionError*(msg: string): RtError
+```
+Creates an `ExceptionRaised` error with a message string.
+
+```nim
+proc exceptionError*(ex: ref Exception): RtError
+```
+Creates an `ExceptionRaised` error from a caught Nim exception.
+
+```nim
+proc foreignError*(msg: string): RtError
+```
+Creates a `ForeignError` for errors originating outside the effect system.
+
+```nim
+proc aggregateError*(errors: seq[RtError]): RtError
+```
+Creates an `AggregateError` bundling multiple failures. Populates `children`.
+
+```nim
+proc withCause*(e: RtError, cause: RtError): RtError
+```
+Returns a copy of `e` with `cause` chained into the `cause` field.
+
+```nim
+proc rootCause*(e: RtError): RtError
+```
+Follows the `cause` chain to its end and returns the originating error.
+
+---
+
+### Supporting Types
+
+#### `TaskId` / `TypedTaskId[T]`
+
+```nim
+type TaskId*        = distinct int
 type TypedTaskId*[T] = object
   id*: TaskId
+const InvalidTaskId* = TaskId(-1)
 ```
 
-Handle for referencing spawned tasks.
+Opaque handles for referencing tasks submitted to an `Engine`. `TypedTaskId[T]` carries the result type at the type level.
 
-### Unit
+#### `Unit`
 
 ```nim
 type Unit* = object
 ```
 
-Represents void/no value. Use `unit()` to create.
+Represents the absence of a meaningful return value (analogous to `void`).
+
+```nim
+proc unit*(): Unit
+```
+Returns the single `Unit` value.
+
+#### `IoInterest`
+
+```nim
+type IoInterest* = enum ioRead, ioWrite
+```
+
+Indicates the direction of interest when waiting on a file descriptor.
 
 ---
 
-## Running Tasks
+## Tier 2: Handler Author API
 
-### runDefault
+Import path: `rteffects/algebra`, `rteffects/vm/types`
 
-```nim
-proc runDefault*[T](t: Task[T]): Result[T]
-```
-
-Runs a task to completion and returns its result.
-
-### runDefaultWithTrace
-
-```nim
-proc runDefaultWithTrace*[T](t: Task[T], hook: TraceHook = nil): TracedResult[T]
-```
-
-Runs a task with tracing support.
-
-### start
-
-```nim
-proc start*[T](t: Task[T]): TaskId
-```
-
-Starts a task and returns its ID. Creates a new runtime.
+Handler authors define named effects and provide implementations that intercept `perform` calls.
 
 ---
 
-## Creating Tasks
-
-### pure
+### `EffectTag`
 
 ```nim
-proc pure*[T](v: T): Task[T]
+type EffectTag* = distinct string
 ```
 
-Creates a task that immediately returns the given value.
-
-### fail
-
-```nim
-proc fail*[T](e: RtError): Task[T]
-```
-
-Creates a task that immediately fails with the given error.
-
-### .rt. macro
-
-```nim
-proc myTask(): Task[T] {.rt.} =
-  # Use await, perform, return inside
-```
-
-Transforms a proc into a CPS-style task.
+A string-typed discriminant that uniquely names an effect. By convention, use a fully-qualified identifier such as `EffectTag("mylib/console/print")` to avoid collisions across packages.
 
 ---
 
-## Task Operations
-
-### spawn / spawnTyped
+### `BoxedValue`
 
 ```nim
-proc spawn*[T](t: Task[T]): Task[TaskId]
-proc spawnTyped*[T](t: Task[T]): Task[TypedTaskId[T]]
+type BoxedValueKind* = enum
+  bvNone, bvInt, bvStr, bvFloat, bvBool, bvRef, bvProgram
+
+type BoxedValue* = object
+  case kind*: BoxedValueKind
+  of bvNone:    discard
+  of bvInt:     intVal*:       int
+  of bvStr:     strVal*:       string
+  of bvFloat:   floatVal*:     float
+  of bvBool:    boolVal*:      bool
+  of bvRef:     refVal*:       RootRef
+  of bvProgram: innerProgram*: EffProgram
+                innerUnboxer*: proc(v: BoxedValue): BoxedValue {.gcsafe.}
 ```
 
-Spawns a child task and returns its ID.
-
-### join / joinTyped
-
-```nim
-proc join*[T](id: TaskId): Task[T]
-proc joinTyped*[T](id: TypedTaskId[T]): Task[T]
-```
-
-Waits for a task to complete and returns its result.
-
-### joinResult / joinTypedResult
-
-```nim
-proc joinResult*[T](id: TaskId): Task[Result[T]]
-proc joinTypedResult*[T](id: TypedTaskId[T]): Task[Result[T]]
-```
-
-Waits for a task and returns its result wrapped in Result.
-
-### cancel / cancelTyped
-
-```nim
-proc cancel*(id: TaskId): Task[Unit]
-proc cancelTyped*[T](id: TypedTaskId[T]): Task[Unit]
-```
-
-Cancels a running task.
-
-### isCancelled
-
-```nim
-proc isCancelled*(): Task[bool]
-```
-
-Checks if the current task has been cancelled.
-
-### checkCancelled
-
-```nim
-proc checkCancelled*(): Task[Unit]
-```
-
-Checks if cancelled and returns error if so.
+A dynamically-typed value used to pass payloads through the VM without generics. Use the box/unbox helpers to convert.
 
 ---
 
-## Combinators
-
-### andThen / flatMap
+### Box / Unbox Helpers
 
 ```nim
-proc andThen*[T, U](t: Task[T], f: proc(v: T): Task[U]): Task[U]
-proc flatMap*[T, U](t: Task[T], f: proc(v: T): Task[U]): Task[U]
+proc boxNone*():          BoxedValue {.raises: [].}
+proc boxInt*(v: int):     BoxedValue {.raises: [].}
+proc boxStr*(v: string):  BoxedValue {.raises: [].}
+proc boxFloat*(v: float): BoxedValue {.raises: [].}
+proc boxBool*(v: bool):   BoxedValue {.raises: [].}
+proc boxRef*(v: RootRef): BoxedValue {.raises: [].}
 ```
 
-Chains tasks. If `t` succeeds, calls `f` with the result.
-
-### map
+Wrap a typed value into `BoxedValue`.
 
 ```nim
-proc map*[T, U](t: Task[T], f: proc(v: T): U): Task[U]
+proc unboxInt*(v: BoxedValue):   int    {.raises: [].}
+proc unboxStr*(v: BoxedValue):   string {.raises: [].}
+proc unboxFloat*(v: BoxedValue): float  {.raises: [].}
+proc unboxBool*(v: BoxedValue):  bool   {.raises: [].}
 ```
 
-Transforms a successful result.
-
-### recover
-
-```nim
-proc recover*[T](t: Task[T], f: proc(e: RtError): Task[T]): Task[T]
-```
-
-Recovers from errors by providing an alternative task.
-
-### recoverWith
-
-```nim
-proc recoverWith*[T](t: Task[T], default: T): Task[T]
-```
-
-Recovers with a default value.
-
-### catchError
-
-```nim
-proc catchError*[T](t: Task[T], f: proc(e: RtError): T): Task[T]
-```
-
-Catches errors and provides a fallback value.
-
-### ensure
-
-```nim
-proc ensure*[T](t: Task[T], finalizer: Task[Unit]): Task[T]
-```
-
-Always runs finalizer, whether success or failure.
+Extract the inner value. Behavior is undefined if `v.kind` does not match. Check `v.kind` before calling.
 
 ---
 
-## Parallel Execution
-
-### all
+### `perform`
 
 ```nim
-proc all*[T](tasks: seq[Task[T]]): Task[seq[T]]
+proc perform*[T](tag: EffectTag, payload: BoxedValue = boxNone()): Eff[T]
 ```
 
-Runs all tasks in parallel, fails fast on first error.
-
-### allSettled
-
-```nim
-proc allSettled*[T](tasks: seq[Task[T]]): Task[seq[Result[T]]]
-```
-
-Runs all tasks, collects all results including failures.
-
-### race / any
-
-```nim
-proc race*[T](tasks: seq[Task[T]]): Task[T]
-proc any*[T](tasks: seq[Task[T]]): Task[T]
-```
-
-Returns the first task to complete, cancels others.
+Introduces an effect into the computation. The VM suspends the current frame and dispatches to the nearest enclosing handler registered for `tag`. If no handler is found the effect propagates upward; if it reaches the top-level runner unhandled, `run` returns a `ForeignError`.
 
 ---
 
-## Retry
-
-### retry
+### `handle`
 
 ```nim
-proc retry*[T](t: Task[T], maxAttempts: int, delay = Duration.default): Task[T]
+proc handle*[T](eff: Eff[T], tag: EffectTag, h: HandlerProc): Eff[T]
 ```
 
-Retries a task up to `maxAttempts` times.
-
-### retryWithBackoff
-
-```nim
-proc retryWithBackoff*[T](t: Task[T], maxAttempts: int,
-                          initialDelay: Duration,
-                          maxDelay = initDuration(seconds = 60)): Task[T]
-```
-
-Retries with exponential backoff.
+Installs handler `h` for the named effect `tag` within the dynamic extent of `eff`. Returns a new `Eff[T]` identical to `eff` but with the handler in scope.
 
 ---
 
-## Timing
-
-### sleep
+### `HandlerProc`
 
 ```nim
-proc sleep*(d: Duration): Task[Unit]
-proc sleep*(interval: TimeInterval): Task[Unit]
+type HandlerProc* = proc(
+  payload: BoxedValue,
+  resume:  proc(v: BoxedValue) {.gcsafe.},
+  abort:   proc(e: RtError)    {.gcsafe.}
+) {.gcsafe, closure.}
 ```
 
-Suspends the task for the given duration.
+Signature for effect handler implementations.
 
-### withTimeout
+- `payload` - the value passed to `perform`.
+- `resume(v)` - call to continue the suspended computation with result value `v`.
+- `abort(e)` - call to inject a failure into the suspended computation.
 
-```nim
-proc withTimeout*[T](timeout: Duration, task: Task[T]): Task[T]
-proc withTimeout*[T](timeout: TimeInterval, task: Task[T]): Task[T]
-```
-
-Adds a timeout to a task. Returns `Timeout` error if exceeded.
-
-### yieldNow
-
-```nim
-proc yieldNow*(): Task[Unit]
-```
-
-Yields control to other tasks.
+A handler must call exactly one of `resume` or `abort`, exactly once.
 
 ---
 
-## Iteration
+## Tier 3: Evaluation Semantics
 
-### forEachTask
+Import path: `rteffects/semantics`
 
-```nim
-proc forEachTask*[T](items: seq[T], body: proc(item: T): Task[Unit]): Task[Unit]
-```
-
-Iterates sequentially over items.
-
-### forEachParallel
-
-```nim
-proc forEachParallel*[T](items: seq[T], body: proc(item: T): Task[Unit]): Task[Unit]
-```
-
-Iterates in parallel over items.
-
-### mapTask
-
-```nim
-proc mapTask*[T, U](items: seq[T], f: proc(item: T): Task[U]): Task[seq[U]]
-```
-
-Maps items in parallel.
-
-### filterTask
-
-```nim
-proc filterTask*[T](items: seq[T], pred: proc(item: T): Task[bool]): Task[seq[T]]
-```
-
-Filters items sequentially.
-
-### whileTask
-
-```nim
-proc whileTask*(cond: proc(): bool, body: Task[Unit]): Task[Unit]
-```
-
-Loops while condition is true.
+The semantics layer exposes a Belnap four-valued logic lattice for programs that must reason about both success and failure simultaneously (e.g., speculative execution, policy checking, or test oracles).
 
 ---
 
-## Resource Management
-
-### bracket
+### `TruthValue`
 
 ```nim
-proc bracket*[R, T](acquire: Task[R],
-                    use: proc(r: R): Task[T],
-                    release: proc(r: R): Task[Unit]): Task[T]
+type TruthValue* = enum
+  tvTrue     # definite success
+  tvFalse    # definite failure
+  tvBoth     # over-determined: both success and failure observed
+  tvNeither  # under-determined: no information yet
 ```
 
-Safe resource management. Release is always called.
+The four elements of the Belnap/Dunn bilattice FOUR. The lattice has two orderings:
 
-### bracketOnError
-
-```nim
-proc bracketOnError*[R, T](acquire: Task[R],
-                           use: proc(r: R): Task[T],
-                           release: proc(r: R): Task[Unit]): Task[T]
-```
-
-Release only called on error.
+- **Information order**: `tvNeither` < `tvTrue`, `tvFalse` < `tvBoth` (more information is higher).
+- **Truth order**: `tvFalse` < `tvNeither`, `tvBoth` < `tvTrue` (more true is higher).
 
 ---
 
-## Channels
-
-### TaskChannel[T]
+### Lattice Operations
 
 ```nim
-proc newTaskChannel*[T](capacity = 0): TaskChannel[T]
+proc join*(a, b: TruthValue): TruthValue {.raises: [].}
 ```
-
-Creates a channel. `capacity = 0` means unbounded.
-
-### send
+Least upper bound in the information order (logical OR over known facts). `tvBoth` if either argument is `tvBoth`.
 
 ```nim
-proc send*[T](ch: TaskChannel[T], value: T): Task[Unit]
+proc meet*(a, b: TruthValue): TruthValue {.raises: [].}
 ```
-
-Sends a value. Blocks if channel is full.
-
-### recv
+Greatest lower bound in the information order (logical AND over known facts). `tvNeither` if either argument is `tvNeither`.
 
 ```nim
-proc recv*[T](ch: TaskChannel[T]): Task[T]
+proc negate*(a: TruthValue): TruthValue {.raises: [].}
 ```
-
-Receives a value. Blocks if channel is empty.
-
-### tryRecv
+Negation: swaps `tvTrue`/`tvFalse`; `tvBoth` and `tvNeither` are fixed points.
 
 ```nim
-proc tryRecv*[T](ch: TaskChannel[T]): Task[Result[T]]
+proc leqI*(a, b: TruthValue): bool {.raises: [].}
 ```
-
-Non-blocking receive.
-
-### closeChannel
-
-```nim
-proc closeChannel*[T](ch: TaskChannel[T]): Task[Unit]
-```
-
-Closes the channel.
-
-### isClosed
-
-```nim
-proc isClosed*[T](ch: TaskChannel[T]): bool
-```
-
-Checks if channel is closed.
+Returns `true` if `a` is below `b` in the information order (`a` has less or equal information than `b`).
 
 ---
 
-## Semaphore
+### `Eval[T]`
 
 ```nim
-proc newSemaphore*(permits: int): Semaphore
-proc acquire*(s: Semaphore): Task[Unit]
-proc release*(s: Semaphore): Task[Unit]
-proc tryAcquire*(s: Semaphore): Task[bool]
-proc withSemaphore*[T](s: Semaphore, t: Task[T]): Task[T]
+type Eval*[T] = object
+  truth*: TruthValue
+  value*: Option[T]
+  error*: Option[RtError]
 ```
+
+The result of `interpret`. Carries a truth value alongside an optional success value and optional error, allowing both to be present simultaneously when `truth = tvBoth`.
 
 ---
 
-## Mutex
+### `Eval` Constructors
 
 ```nim
-proc newMutex*(): Mutex
-proc lock*(m: Mutex): Task[Unit]
-proc unlock*(m: Mutex): Task[Unit]
-proc tryLock*(m: Mutex): Task[bool]
-proc withMutex*[T](m: Mutex, t: Task[T]): Task[T]
+proc evalTrue*[T](v: T): Eval[T] {.raises: [].}
 ```
+Definite success: `truth = tvTrue`, `value = some(v)`.
+
+```nim
+proc evalFalse*[T](e: RtError): Eval[T] {.raises: [].}
+```
+Definite failure: `truth = tvFalse`, `error = some(e)`.
+
+```nim
+proc evalBoth*[T](v: T, e: RtError): Eval[T] {.raises: [].}
+```
+Over-determined: `truth = tvBoth`, both `value` and `error` are set.
+
+```nim
+proc evalNeither*[T](): Eval[T] {.raises: [].}
+```
+Under-determined: `truth = tvNeither`, neither `value` nor `error` is set.
 
 ---
 
-## Nursery (Structured Concurrency)
-
-### NurseryPolicy
+### `Eval` Combinators
 
 ```nim
-type NurseryPolicy* = enum
-  npFailFast,    # Cancel all on first failure
-  npCollectAll,  # Run all, aggregate errors
-  npSupervise    # Run all, record errors but succeed
+proc map*[T, U](ev: Eval[T], f: proc(v: T): U): Eval[U]
 ```
-
-### Nursery
+Applies `f` to the success value if present; propagates truth value and error unchanged.
 
 ```nim
-proc newNursery*(policy = npFailFast): Nursery
-proc spawnChild*(n: Nursery, t: Task[Unit]): Task[TaskId]
-proc joinAll*(n: Nursery): Task[Unit]
-proc errors*(n: Nursery): seq[RtError]
+proc flatMap*[T, U](ev: Eval[T], f: proc(v: T): Eval[U]): Eval[U]
 ```
-
-### TypedNursery[T]
-
-```nim
-proc newTypedNursery*[T](policy = npFailFast): TypedNursery[T]
-proc spawnChild*[T](n: TypedNursery[T], t: Task[T]): Task[TaskId]
-proc joinAll*[T](n: TypedNursery[T]): Task[Unit]
-proc joinAllValues*[T](n: TypedNursery[T]): Task[seq[T]]
-proc joinAllResults*[T](n: TypedNursery[T]): Task[seq[Result[T]]]
-proc results*[T](n: TypedNursery[T]): seq[Result[T]]
-proc successResults*[T](n: TypedNursery[T]): seq[T]
-proc errors*[T](n: TypedNursery[T]): seq[RtError]
-```
-
-### Nursery Scopes
-
-```nim
-proc nursery*(body: proc(n: Nursery): Task[Unit], policy = npFailFast): Task[Unit]
-proc typedNursery*[T](body: proc(n: TypedNursery[T]): Task[Unit],
-                      policy = npFailFast): Task[seq[T]]
-proc typedNurseryAll*[T](body: proc(n: TypedNursery[T]): Task[Unit],
-                         policy = npFailFast): Task[seq[Result[T]]]
-```
+Chains two `Eval` computations, joining truth values and merging errors via `join`.
 
 ---
 
-## AsyncDispatch Interop
-
-### awaitFuture
+### `interpret` Runner
 
 ```nim
-proc awaitFuture*[T](fut: Future[T]): Task[T]
+proc interpret*[T](eff: Eff[T], budget = 10000): Eval[T]
 ```
 
-Awaits an asyncdispatch Future.
-
-### toFuture
-
-```nim
-proc toFuture*[T](t: Task[T]): Future[T]
-```
-
-Converts a Task to a Future.
-
-### awaitIO
-
-```nim
-proc awaitIO*(ev: AsyncEvent): Task[Unit]
-proc awaitIO*(fd: AsyncFD, interest: IoInterest): Task[Unit]
-```
-
-Waits for I/O readiness.
+Runs `eff` under the four-valued semantics. Unlike `run`, does not collapse `tvBoth` to an error; callers can inspect both the value and the error when the program is over-determined. Unhandled effects produce `tvFalse` with a `ForeignError`.
 
 ---
 
-## Tracing
-
-### trace
+### `toResult`
 
 ```nim
-proc trace*(msg: string): Task[Unit]
+proc toResult*[T](ev: Eval[T]): Result[T] {.raises: [].}
 ```
 
-Emits a trace message.
+Collapses an `Eval[T]` to a classical `Result[T]`:
+
+| `truth`      | outcome                                    |
+|--------------|--------------------------------------------|
+| `tvTrue`     | `Result` with `isOk = true`                |
+| `tvFalse`    | `Result` with `isOk = false`, carries error |
+| `tvBoth`     | `Result` with `isOk = false`, `Contradiction` error |
+| `tvNeither`  | `Result` with `isOk = false`, `Incomplete` error |
 
 ---
 
-## Error Constructors
+## Tier 4: VM Internals
+
+Import paths: `rteffects/vm/types`, `rteffects/vm/engine`
+
+This tier is intended for library developers extending the runtime. Application code and handler authors should not depend on these types directly, as they may change between minor versions.
+
+---
+
+### `EffProgram` and `EffOp`
 
 ```nim
-proc cancelledError*(): RtError
-proc timeoutError*(): RtError
-proc exceptionError*(msg: string): RtError
-proc exceptionError*(ex: ref Exception): RtError
-proc foreignError*(msg: string): RtError
-proc aggregateError*(errors: seq[RtError]): RtError
+type ContId* = distinct int   # index into EffProgram.ops
+
+type EffOpKind* = enum
+  opPure, opFail, opBind, opMap, opPerform, opHandle
+
+type EffOp* = object  # variant; fields depend on EffOpKind
+
+type EffProgram* = object
+  ops*:   seq[EffOp]
+  entry*: ContId
 ```
 
-### Error Chaining
+`EffProgram` is the bytecode representation produced by the smart constructors (`pure`, `fail`, `andThen`, `map`, `perform`, `handle`). `ContId` is an index into `ops` used as a continuation pointer. Use `addOp` to append operations when constructing programs programmatically.
 
 ```nim
-proc withCause*(e: RtError, cause: RtError): RtError
-proc rootCause*(e: RtError): RtError
+proc addOp*(prog: var EffProgram, op: EffOp): ContId
 ```
+Appends an `EffOp` to `prog.ops` and returns its index.
+
+---
+
+### `Engine` and `Frame`
+
+```nim
+type FrameState* = enum fsReady, fsRunning, fsSuspended, fsDone
+type FrameEvent* = enum evDequeue, evYield, evComplete, evSuspend, evResume
+
+type HandlerEntry* = object
+  tag*:  EffectTag
+  impl*: HandlerProc
+
+type Frame* = object
+  id*:        FrameId
+  pc*:        ContId
+  program*:   EffProgram
+  sm*:        StateMachine[FrameState, FrameEvent]
+  result*:    BoxedValue
+  hasResult*: bool
+  failed*:    bool
+  error*:     RtError
+  handlers*:  seq[HandlerEntry]
+  contStack*: seq[ContId]
+
+type Engine* = ref object
+  frames*:  Table[int, Frame]
+  readyQ*:  Deque[int]
+  nextId*:  int
+  budget*:  int
+```
+
+`Engine` is a cooperative, single-threaded effect interpreter. It maintains a ready queue of `Frame` values and steps each frame until the budget is exhausted or all frames reach `fsDone`. `Frame.sm` is an actor state machine (from the `actor-state-machine` package) that enforces valid state transitions.
+
+```nim
+proc newEngine*(budget = 1000): Engine
+```
+Allocates a new `Engine` with the given step budget.
+
+---
+
+## Module Index
+
+| Module | Import path | Tier |
+|--------|-------------|------|
+| Core types and error constructors | `rteffects/core` | 1 |
+| Effect algebra (`Eff`, `pure`, `fail`, `andThen`, `map`, `run`, `perform`, `handle`) | `rteffects/algebra` | 1, 2 |
+| Four-valued semantics (`Eval`, `TruthValue`, `interpret`) | `rteffects/semantics` | 3 |
+| VM value representation (`BoxedValue`, `EffProgram`, `EffOp`) | `rteffects/vm/types` | 2, 4 |
+| VM execution engine (`Engine`, `Frame`) | `rteffects/vm/engine` | 4 |

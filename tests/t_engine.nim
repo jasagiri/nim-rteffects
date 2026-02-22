@@ -1,10 +1,9 @@
-import std/[unittest, options]
+import std/[unittest, options, tables]
 import rteffects/core
 import rteffects/semantics
 import rteffects/vm/types
 import rteffects/algebra
 import rteffects/vm/engine
-import state_machine
 
 suite "Engine - pure/fail interpretation":
   test "given pure(42) when interpreted then evalTrue(42)":
@@ -105,44 +104,26 @@ suite "Runner ACL":
     check result.isOk
     check result.ok == 11
 
-suite "Engine - frame state machine integration":
-  test "given pure(42) then frame SM ends in fsDone":
+suite "Engine - frame state tracking":
+  test "given pure(42) then frame ends in fsDone":
     let engine = newEngine()
     let eff = pure[int](42)
     let frameId = engine.newFrame(eff.program, eff.program.entry)
     engine.runLoop()
     let frame = engine.frames[frameId]
     check frame.state == fsDone
-    check frame.sm.getState() == fsDone
 
-  test "given pure(42) then frame SM has transition history":
-    let engine = newEngine()
-    let eff = pure[int](42)
-    let frameId = engine.newFrame(eff.program, eff.program.entry)
-    engine.runLoop()
-    let frame = engine.frames[frameId]
-    let history = frame.sm.getHistory()
-    # Ready → Running → Done
-    check history.len == 2
-    check history[0].fromState == fsReady
-    check history[0].toState == fsRunning
-    check history[1].fromState == fsRunning
-    check history[1].toState == fsDone
-
-  test "given map chain then frame SM tracks yield transitions":
+  test "given map chain then frame ends in fsDone":
     let engine = newEngine()
     let eff = pure[int](5).map(proc(x: int): int {.gcsafe.} = x * 2)
     let frameId = engine.newFrame(eff.program, eff.program.entry)
     engine.runLoop()
     let frame = engine.frames[frameId]
-    let history = frame.sm.getHistory()
-    # Ready→Running (opMap first visit) → Ready (yield to target)
-    # → Running (opPure) → Ready (return to opMap)
-    # → Running (opMap apply) → Done
-    check history.len >= 4
     check frame.state == fsDone
+    check frame.hasResult
+    check unboxInt(frame.result) == 10
 
-  test "given andThen then frame SM records multiple cycles":
+  test "given andThen then frame ends in fsDone with correct value":
     let engine = newEngine()
     let eff = pure[int](1).andThen(proc(x: int): Eff[int] {.gcsafe.} =
       pure[int](x + 1)
@@ -150,16 +131,4 @@ suite "Engine - frame state machine integration":
     let frameId = engine.newFrame(eff.program, eff.program.entry)
     engine.runLoop()
     let frame = engine.frames[frameId]
-    let history = frame.sm.getHistory()
-    # Multiple Ready ↔ Running cycles
-    check history.len >= 4
     check frame.state == fsDone
-
-  test "given frame SM then metrics track transition counts":
-    let engine = newEngine()
-    let eff = pure[int](42)
-    let frameId = engine.newFrame(eff.program, eff.program.entry)
-    engine.runLoop()
-    let frame = engine.frames[frameId]
-    check frame.sm.metrics.totalTransitions == 2
-    check frame.sm.metrics.successfulTransitions == 2

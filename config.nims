@@ -1,2 +1,1 @@
-switch("path", "../egison-patterns/src")
-switch("path", "../actor-state-machine/src")
+# No external path dependencies required

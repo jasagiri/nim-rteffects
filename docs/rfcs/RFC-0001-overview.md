@@ -90,7 +90,7 @@ continuation table represents the same control flow as flat data:
 │  VM Execution (internal)                    │
 │  Frame, EffProgram, Engine                  │
 │  Defunctionalized continuation table        │
-│  StateMachine[FrameState, FrameEvent]       │
+│  Lightweight enum state (ADR-006)           │
 │  → Completely hidden from users             │
 └────────┬────────────────────────────────────┘
          │ Eval[T] → Result[T] (ACL)
@@ -135,7 +135,7 @@ They will be reimplemented as v2 effect handlers in a future iteration.
 ```
 User writes:   perform FileRead("config.json")
 Handler sees:  BoxedValue + resume/abort closures (→ TruthValue implicitly)
-VM executes:   Frame state transitions on EffProgram (StateMachine[FrameState, FrameEvent])
+VM executes:   Frame state transitions on EffProgram (lightweight enum, ADR-006)
 Runner exits:  Result[T] (the only 2-valued boundary)
 ```
 
@@ -162,10 +162,11 @@ allowing the engine to resolve inner programs without circular imports.
 
 ## External Dependencies
 
-- **`actor_state_machine`** (`state_machine` import): Provides
-  `StateMachine[FrameState, FrameEvent]` for Frame lifecycle management.
-  The Frame state machine validates transitions between `fsReady`, `fsRunning`,
-  `fsSuspended`, and `fsDone`, with history tracking and metrics.
+None. The library requires only `nim >= 2.3.0`.
+
+The `actor-state-machine` dependency was removed in ADR-006 after benchmarking
+showed it consumed 57% of execution time. Frame state is now a lightweight enum
+with optional debug history (`-d:rteffectsDebug`).
 
 ## Key Decisions
 
@@ -174,6 +175,7 @@ allowing the engine to resolve inner programs without circular imports.
 - **ADR-003**: Algebraic effects (perform/handle) as primary API
 - **ADR-004**: 3-tier API visibility (app / handler / runner)
 - **ADR-005**: Module boundaries derived from bounded context analysis
+- **ADR-006**: VM performance optimization (StateMachine removal, fast paths)
 
 ## Migration Path
 

@@ -1,10 +1,11 @@
 # Getting Started with RTEffects
 
-RTEffects is a CPS (Continuation-Passing Style) based runtime effects library for Nim. It provides structured concurrency, async operations, and powerful error handling without the complexity of traditional async/await.
+RTEffects v2 is an algebraic effects system for Nim with Belnap 4-valued logic. It lets you describe effectful computations as first-class values, compose them safely, and control their semantics through handlers.
 
 ## Requirements
 
-- Nim >= 2.3.0
+- Nim >= 2.0.0
+- `actor-state-machine` (sibling package, for VM state management)
 
 ## Installation
 
@@ -20,112 +21,230 @@ Or install directly:
 nimble install rteffects
 ```
 
+## API Tiers
+
+The library is organised into three tiers:
+
+| Tier | Who uses it | Imports |
+|------|-------------|---------|
+| **Tier 1** — App developer | `Eff[T]`, `pure`, `fail`, `andThen`, `map`, `run` | `rteffects/algebra`, `rteffects/vm/engine` |
+| **Tier 2** — Handler author | `perform`, `handle`, `EffectTag`, `BoxedValue`, `HandlerProc` | `rteffects/algebra`, `rteffects/vm/types` |
+| **Tier 3** — Semantics | `TruthValue`, `Eval[T]`, `interpret` | `rteffects/semantics`, `rteffects/vm/engine` |
+
+Most application code only needs Tier 1.
+
 ## Basic Concepts
 
-### Tasks
+### Eff[T]
 
-A `Task[T]` represents an asynchronous computation that will produce a value of type `T` (or an error). Tasks are lazy - they don't execute until run.
+`Eff[T]` is a description of an effectful computation that produces a value of type `T`. Like a recipe, it does nothing on its own — you hand it to `run` to execute it.
 
 ```nim
-import rteffects
+import rteffects/algebra
+import rteffects/vm/engine
 
-# Define a task using the .rt. macro
-proc myTask(): Task[int] {.rt.} =
-  return 42
+# Lift a plain value into Eff
+let greeting: Eff[string] = pure("hello")
 
-# Run the task
-let result = runDefault(myTask())
+# Run the computation
+let result = run(greeting)
 if result.isOk:
-  echo "Got: ", result.ok
-else:
-  echo "Error: ", result.err
+  echo result.ok   # hello
 ```
 
-### The .rt. Macro
+### pure and fail
 
-The `.rt.` pragma transforms a regular proc into a task-returning proc with CPS transformation. Inside `.rt.` procs, you can use:
-
-- `await` - Wait for another task and get its result
-- `perform` - Execute an effect (like `sleep`)
-- `return` - Return a value (transformed into `pure(value)`)
+`pure` wraps a value in a successful `Eff`. `fail` creates an `Eff` that carries an `RtError`.
 
 ```nim
-proc fetchData(): Task[string] {.rt.} =
-  # Sleep for 100ms
-  perform sleep(100.milliseconds)
+import rteffects/algebra
+import rteffects/vm/engine
+import rteffects/core
 
-  # Call another task
-  let data = await otherTask()
+# Success
+let ok = pure(42)
 
-  return "Processed: " & data
+# Failure
+let err = fail[int](RtError(kind: Contradiction, msg: "bad state"))
+
+# run returns Result[T]
+let r = run(ok)
+echo r.isOk   # true
+echo r.ok     # 42
+
+let e = run(err)
+echo e.isOk   # false
+echo e.err.msg
 ```
 
-### Running Tasks
+### Result[T]
 
-Use `runDefault` to execute a task and get its result:
+`run` returns `Result[T]`, a simple discriminated record:
 
 ```nim
-let result = runDefault(myTask())
-# result is Result[T] with isOk, ok, and err fields
+type Result*[T] = object
+  isOk*: bool
+  ok*: T
+  err*: RtError
 ```
 
-## Common Patterns
+`RtError` carries a `kind` (`Timeout`, `Cancelled`, `ExceptionRaised`, `ForeignError`, `AggregateError`, `Contradiction`, `Incomplete`), a `msg`, an optional `cause`, and a `stackTrace`.
 
-### Sequential Operations
+## Chaining Computations
 
-```nim
-proc sequential(): Task[string] {.rt.} =
-  let a = await taskA()
-  let b = await taskB()
-  let c = await taskC()
-  return a & b & c
-```
+### andThen
 
-### Parallel Operations
+`andThen` sequences two computations. The second receives the value produced by the first.
 
-Use `all` to run multiple tasks in parallel:
+All closures passed to `andThen` must carry the `{.gcsafe.}` pragma.
 
 ```nim
-proc parallel(): Task[seq[int]] =
-  all(@[task1(), task2(), task3()])
+import rteffects/algebra
+import rteffects/vm/engine
 
-# Or use race to get the first result
-proc fastest(): Task[int] =
-  race(@[slowTask(), fastTask()])
-```
+proc readConfig(): Eff[string] =
+  pure("/etc/app/config.toml")
 
-### Error Handling
+proc loadFile(path: string): Eff[int] =
+  # pretend we read a line count
+  pure(path.len)
 
-```nim
-proc withErrorHandling(): Task[int] =
-  let task = riskyOperation()
-
-  # Recover from errors
-  recover(task, proc(e: RtError): Task[int] {.gcsafe, closure.} =
-    pure(defaultValue)
+let pipeline =
+  readConfig().andThen(proc(path: string): Eff[int] {.gcsafe.} =
+    loadFile(path)
   )
+
+let result = run(pipeline)
+echo result.ok   # length of the config path string
 ```
 
-### Timeouts
+### map
+
+`map` transforms the produced value without introducing a new effect. It is equivalent to `andThen` followed by `pure`.
 
 ```nim
-proc withTimeout(): Task[string] =
-  withTimeout(5.seconds, longRunningTask())
+import rteffects/algebra
+import rteffects/vm/engine
+
+let doubled =
+  pure(21).map(proc(n: int): int {.gcsafe.} = n * 2)
+
+echo run(doubled).ok   # 42
 ```
 
-### Resource Management
+Chain multiple `map` and `andThen` calls to build longer pipelines:
 
 ```nim
-proc withResource(): Task[string] =
-  bracket(
-    acquireResource(),  # Acquire
-    useResource,        # Use
-    releaseResource     # Release (always called)
-  )
+let result =
+  pure(10)
+    .map(proc(n: int): int {.gcsafe.} = n + 5)
+    .map(proc(n: int): string {.gcsafe.} = "value=" & $n)
+    .andThen(proc(s: string): Eff[string] {.gcsafe.} =
+      pure(s & "!")
+    )
+
+echo run(result).ok   # value=15!
 ```
+
+## Error Handling
+
+Use `fail` to signal an error at any point. Once a `fail` enters the pipeline, subsequent `andThen` and `map` steps are skipped.
+
+```nim
+import rteffects/algebra
+import rteffects/vm/engine
+import rteffects/core
+
+proc divide(a, b: int): Eff[int] =
+  if b == 0:
+    fail[int](RtError(kind: Contradiction, msg: "division by zero"))
+  else:
+    pure(a div b)
+
+# Error propagates through map — the map body is never called
+let result =
+  divide(10, 0).map(proc(n: int): string {.gcsafe.} = "got " & $n)
+
+let r = run(result)
+echo r.isOk        # false
+echo r.err.msg     # division by zero
+```
+
+The `budget` parameter of `run` sets a step limit. Exceeding it yields an `Incomplete` error:
+
+```nim
+let r = run(myEff, budget = 500)
+if not r.isOk and r.err.kind == Incomplete:
+  echo "computation ran out of steps"
+```
+
+## Algebraic Effects
+
+Algebraic effects let a computation declare that it needs something from the outside world — logging, state, I/O — without hardcoding how that need is satisfied. The computation calls `perform`; a `handle` wrapper supplies the answer.
+
+### EffectTag and BoxedValue
+
+`EffectTag` is a distinct string that names an effect. `BoxedValue` is a type-erased container used to pass data into and out of effect operations.
+
+```nim
+import rteffects/vm/types
+
+let tag = EffectTag("double")
+let bv = boxInt(42)
+echo unboxInt(bv)    # 42
+```
+
+### perform and handle
+
+`perform` suspends the current computation and emits an effect to the nearest matching handler. `handle` installs a handler for one `EffectTag`. The handler receives the payload and `resume`/`abort` callbacks.
+
+```nim
+import rteffects/core
+import rteffects/algebra
+import rteffects/vm/engine
+import rteffects/vm/types
+
+let doubleTag = EffectTag("double")
+
+# Request the "double" effect with payload 21
+let body = perform[int](doubleTag, boxInt(21))
+
+# Attach a handler that doubles the payload
+let handled = body.handle(doubleTag,
+  proc(payload: BoxedValue,
+       resume: proc(v: BoxedValue) {.gcsafe.},
+       abort: proc(e: RtError) {.gcsafe.}) {.gcsafe.} =
+    let n = unboxInt(payload)
+    resume(boxInt(n * 2))
+)
+
+let r = run[int](handled)
+echo r.ok   # 42
+```
+
+Different handlers can give the same computation entirely different semantics — the same `perform` can be handled by a production handler, a mock handler for testing, or an aborting handler that validates input.
+
+## Tier 3: Belnap Semantics
+
+For advanced use-cases you can inspect the 4-valued truth of a result with `interpret`:
+
+```nim
+import rteffects/algebra
+import rteffects/vm/engine
+import rteffects/semantics
+
+let eval = interpret[int](pure[int](42))
+case eval.truth
+of tvTrue:    echo "definite success"
+of tvFalse:   echo "definite failure"
+of tvBoth:    echo "both success and failure (contradiction)"
+of tvNeither: echo "no information yet (incomplete)"
+```
+
+`Eval[T]` carries a `truth: TruthValue`, an `value: Option[T]`, and an `error: Option[RtError]`.
 
 ## Next Steps
 
-- See [API Reference](api_reference.md) for complete API documentation
-- Check [Examples](../examples/) for practical use cases
-- Read [Patterns](patterns.md) for advanced patterns and best practices
+- [API Reference](api_reference.md) — complete type and proc documentation
+- [Examples](../examples/) — runnable programs covering common patterns
+- [Patterns](patterns.md) — composing handlers, testing with effect stubs, error recovery

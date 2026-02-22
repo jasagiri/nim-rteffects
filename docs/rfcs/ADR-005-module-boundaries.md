@@ -84,14 +84,15 @@ vm/types.nim (depends on core for RtError)
     ^
 algebra.nim (depends on core, vm/types for ContId/EffProgram/BoxedValue)
     ^
-vm/engine.nim (depends on core, semantics, vm/types, algebra, state_machine)
+vm/engine.nim (depends on core, semantics, vm/types, algebra)
 ```
 
 #### External Dependencies
 
-- `state_machine` from `actor-state-machine` library: used in `vm/engine.nim`
-  for `StateMachine[FrameState, FrameEvent]` to manage frame state transitions
-  with validation, history tracking, metrics, and observer support.
+None. The library has no external dependencies beyond `nim >= 2.3.0`.
+
+The `actor-state-machine` dependency was removed after ADR-006 identified it
+as the dominant performance bottleneck (57% of execution time).
 
 #### Key Constraints
 
@@ -99,8 +100,8 @@ vm/engine.nim (depends on core, semantics, vm/types, algebra, state_machine)
 - `vm/types.nim` does NOT import `semantics.nim` -- it depends only on `core.nim`.
 - Handler callbacks in `algebra.nim` are inline closures (HandlerProc), not
   a separate Resumption type.
-- Scheduling is handled by `vm/engine.nim` via a `readyQ: Deque[FrameId]`
-  inside the Engine -- there is no separate scheduler module.
+- Scheduling is handled by `vm/engine.nim` via a `readyQ: seq[int]` with
+  a `readyHead` index inside the Engine -- there is no separate scheduler module.
 
 ### File Layout (current implementation)
 

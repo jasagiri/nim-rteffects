@@ -9,6 +9,14 @@ nimcache/
 examples/ex[0-9]*[!.nim]
 tests/t_*[!.nim]
 
+# Benchmark binaries
+benchmarks/bench
+benchmarks/bench_cost
+benchmarks/bench_opt
+
+# Compiled VM engine binary
+src/rteffects/vm/engine
+
 # OS files
 .DS_Store
 Thumbs.db
