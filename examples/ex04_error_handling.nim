@@ -1,70 +1,43 @@
-## Example 04: Error Handling
+## ex04: Error Handling
 ##
-## Demonstrates various error handling patterns.
+## Errors short-circuit through andThen chains.
+## The first failure stops the chain — subsequent steps are skipped.
 
-import std/times
-import rteffects
+import rteffects/core
+import rteffects/algebra
+import rteffects/vm/types
+import rteffects/vm/engine
 
-# Task that might fail
-proc riskyOperation(shouldFail: bool): Task[int] {.rt.} =
-  if shouldFail:
-    raise newException(ValueError, "Operation failed!")
-  return 42
-
-# Task that returns an error
-proc failingTask(): Task[int] {.rt.} =
-  return await fail[int](foreignError("Something went wrong"))
-
-# Example 1: Catching exceptions
-proc example1(): Task[string] {.rt.} =
-  let result = runDefault(riskyOperation(true))
-  if result.isOk:
-    return "Success: " & $result.ok
-  else:
-    return "Caught error: " & result.err.msg
-
-# Example 2: Using recover
-proc example2(): Task[int] =
-  let task = fail[int](foreignError("initial error"))
-  recover(task, proc(e: RtError): Task[int] {.gcsafe, closure.} =
-    echo "Recovering from: ", e.msg
-    pure(99)  # Return default value
+# --- Failure short-circuits the chain ---
+let err = RtError(kind: ForeignError, msg: "database connection failed")
+let eff1 = fail[int](err)
+  .andThen(proc(x: int): Eff[int] {.gcsafe.} =
+    echo "This should NOT print"
+    pure[int](x + 1)
   )
+let result1 = run[int](eff1)
+assert not result1.isOk
+echo "Short-circuit: ", result1.err.msg
 
-# Example 3: Using recoverWith for simple default
-proc example3(): Task[int] =
-  let task = fail[int](foreignError("error"))
-  recoverWith(task, -1)  # Simply return -1 on error
-
-# Example 4: Using catchError
-proc example4(): Task[int] =
-  let task = fail[int](foreignError("caught error"))
-  catchError(task, proc(e: RtError): int {.gcsafe, closure.} =
-    echo "Caught: ", e.msg
-    0
+# --- Failure mid-chain ---
+let eff2 = pure[int](1)
+  .andThen(proc(x: int): Eff[int] {.gcsafe.} =
+    fail[int](RtError(kind: Timeout, msg: "step 2 timed out"))
   )
+  .andThen(proc(x: int): Eff[int] {.gcsafe.} =
+    echo "This should NOT print either"
+    pure[int](x * 100)
+  )
+let result2 = run[int](eff2)
+assert not result2.isOk
+echo "Mid-chain failure: ", result2.err.kind, " - ", result2.err.msg
 
-# Example 5: Error chaining
-proc example5(): Task[Unit] {.rt.} =
-  let innerError = foreignError("database connection failed")
-  let outerError = foreignError("user lookup failed").withCause(innerError)
+# --- Success flows through normally ---
+let eff3 = pure[int](10)
+  .andThen(proc(x: int): Eff[int] {.gcsafe.} = pure[int](x + 5))
+  .andThen(proc(x: int): Eff[int] {.gcsafe.} = pure[int](x * 2))
+let result3 = run[int](eff3)
+assert result3.isOk
+echo "Success chain: 10 -> +5 -> *2 = ", result3.ok  # 30
 
-  echo "Error: ", outerError.msg
-  echo "Root cause: ", rootCause(outerError).msg
-
-  return unit()
-
-echo "=== Example 1: Exception handling ==="
-echo runDefault(example1()).ok
-
-echo "\n=== Example 2: Using recover ==="
-echo "Result: ", runDefault(example2()).ok
-
-echo "\n=== Example 3: Using recoverWith ==="
-echo "Result: ", runDefault(example3()).ok
-
-echo "\n=== Example 4: Using catchError ==="
-echo "Result: ", runDefault(example4()).ok
-
-echo "\n=== Example 5: Error chaining ==="
-discard runDefault(example5())
+echo "\nAll ex04 checks passed."
