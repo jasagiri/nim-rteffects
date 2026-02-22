@@ -25,43 +25,46 @@ Implement a 3-tier visibility model where each tier sees exactly what it needs.
 
 ### Tier 1: App Developer API
 
-**Sees**: `Eff[T]`, `perform`, `handle`, `pure`, `andThen`, `map`
-**Does NOT see**: `TruthValue`, `Eval[T]`, `Resumption`, `Frame`, `EffProgram`
+**Sees**: `Eff[T]`, `perform`, `handle`, `pure`, `andThen`, `map`, `BoxedValue`
+**Does NOT see**: `TruthValue`, `Eval[T]`, `Frame`, `EffProgram`, `Engine`
 
 ```nim
 import rteffects/algebra
 
-proc myTask(): Eff[int] {.rt.} =
-  let x = perform ReadConfig("key")
-  let y = perform Compute(x)
-  pure(y)
+let tag = EffectTag("readConfig")
+let eff = perform[string](tag, boxStr("key"))
+  .andThen(proc(raw: string): Eff[Config] {.gcsafe.} =
+    pure(parseConfig(raw))
+  )
 ```
 
-The `.rt.` macro provides syntactic sugar. Without it, the builder API
-(`pure`, `andThen`, `perform`) is still usable directly.
+The builder API (`pure`, `andThen`, `perform`, `handle`, `map`) is the primary
+interface. A `.rt.` macro for syntactic sugar is planned but not yet implemented.
 
 Effect declaration is by convention (EffectTag constants), not by import.
 
 ### Tier 2: Handler Author API
 
-**Sees**: Everything in Tier 1 + `TruthValue`, `Eval[T]`, `Resumption`
+**Sees**: Everything in Tier 1 + `TruthValue`, `Eval[T]`, `BoxedValue` constructors
 **Does NOT see**: `Frame`, `EffProgram`, `ContId`, `Engine` internals
 
 ```nim
 import rteffects/[algebra, semantics]
-import rteffects/vm/types  # for Resumption
+import rteffects/vm/types  # for BoxedValue constructors
 
-proc myHandler(payload: RootRef, resume: Resumption) =
-  # Can inspect TruthValue, choose resumption strategy
-  resume.resume(box(value))   # → tvTrue
+proc myHandler(payload: BoxedValue,
+               resume: proc(v: BoxedValue) {.gcsafe.},
+               abort: proc(e: RtError) {.gcsafe.}) {.gcsafe.} =
+  # Choose resumption strategy — implicitly determines TruthValue
+  resume(boxStr(value))   # → tvTrue
   # or
-  resume.abort(error)         # → tvFalse
+  abort(RtError(kind: ForeignError, msg: "failed"))  # → tvFalse
   # or
-  resume.suspend()            # → tvNeither
+  discard  # call neither → tvNeither (implicit suspend)
 ```
 
 Handler authors import `semantics` to access `TruthValue` and `Eval[T]`
-operations (join, meet, negate) for composing evaluation results.
+operations (join, meet, negate, leqI) for composing evaluation results.
 
 ### Tier 3: Runner API
 
@@ -69,32 +72,36 @@ operations (join, meet, negate) for composing evaluation results.
 **Does NOT see**: Any internal state
 
 ```nim
-import rteffects/runner
+import rteffects/vm/engine  # run() lives in engine.nim
 
-let result = run(handledComputation)
-# result: Result[T] — the only 2-valued boundary
+let result = run[int](handledComputation)
+# result: Result[int] — the only 2-valued boundary
 if result.isOk:
   echo result.ok
 else:
   echo result.err
 ```
 
+Note: `run()` and `interpret()` are in `vm/engine.nim`, not a separate
+`runner.nim` module. The runner ACL is co-located with the VM engine.
+
 ### Import Graph
 
 ```
 Tier 1 (app developer):
   import rteffects/algebra     # Eff[T], pure, andThen, perform, handle
+  import rteffects/vm/types    # BoxedValue, EffectTag constructors
 
 Tier 2 (handler author):
   import rteffects/algebra     # Tier 1 API
   import rteffects/semantics   # TruthValue, Eval[T], lattice ops
-  import rteffects/vm/types    # Resumption
+  import rteffects/vm/types    # BoxedValue constructors
 
 Tier 3 (runner):
-  import rteffects/runner      # run() → Result[T]
+  import rteffects/vm/engine   # run(), interpret() → Result[T] / Eval[T]
 
 Convenience:
-  import rteffects             # Re-exports algebra + runner (Tiers 1+3)
+  import rteffects             # Re-exports algebra + engine (Tiers 1+3)
 ```
 
 ### What each tier CAN and CANNOT do
@@ -105,7 +112,7 @@ Convenience:
 | Perform effects | Yes | Yes | — |
 | Install handlers | Yes | Yes | — |
 | Access TruthValue | No | Yes | No |
-| Resume/abort/suspend | No | Yes | No |
+| Resume/abort (closures) | No | Yes | No |
 | Inspect Eval[T] | No | Yes | No |
 | Run to Result[T] | — | — | Yes |
 | Access VM internals | No | No | No |

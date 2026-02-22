@@ -98,7 +98,7 @@ type
   Eval*[T] = object
     truth*: TruthValue
     value*: Option[T]
-    error*: Option[EffError]
+    error*: Option[RtError]
 ```
 
 Invariants:
@@ -107,15 +107,29 @@ Invariants:
 - `tvBoth` → `value.isSome`, `error.isSome`
 - `tvNeither` → `value.isNone`, `error.isNone`
 
+### Operations on Eval[T]
+
+```nim
+proc map*[T, U](ev: Eval[T], f: proc(v: T): U): Eval[U]
+  ## Transform value if present (tvTrue or tvBoth). Error and truth preserved.
+
+proc flatMap*[T, U](ev: Eval[T], f: proc(v: T): Eval[U]): Eval[U]
+  ## Chain evaluation. Invokes f when value is present.
+  ## For tvBoth, inner result's truth is joined with tvBoth.
+
+proc leqI*(a, b: TruthValue): bool
+  ## Information ordering: a <=i b iff join(a, b) == b.
+```
+
 ### ACL Collapse (4-value → 2-value)
 
 ```nim
-proc toResult*[T](ev: Eval[T]): Result[T] =
+proc toResult*[T](ev: Eval[T]): Result[T] {.raises: [].} =
   case ev.truth
   of tvTrue:    ok(ev.value.get)
   of tvFalse:   err(ev.error.get)
-  of tvBoth:    err(contradictionError(ev.error.get))
-  of tvNeither: err(incompleteError())
+  of tvBoth:    err(RtError(kind: Contradiction, msg: "contradictory evaluation"))
+  of tvNeither: err(RtError(kind: Incomplete, msg: "incomplete evaluation"))
 ```
 
 This is the **only** boundary where 4-valued collapses to 2-valued.
@@ -153,7 +167,7 @@ The lattice properties guarantee that combining evaluations is well-defined.
 
 - Additional complexity in the evaluation layer
 - `tvBoth` scenarios must be carefully designed (when does B arise?)
-- New error kinds (`ekContradiction`, `ekIncomplete`) needed in Result
+- New error kinds (`Contradiction`, `Incomplete`) needed in RtErrorKind
 
 ### Neutral
 
@@ -173,9 +187,12 @@ let result = runDefault(race(@[taskA(), taskB()]))
 ### After (v2 — handler author perspective)
 
 ```nim
-# Handler for race effect
-proc raceHandler(branches: seq[Eff[T]], resume: Resumption) =
+# Handler for race effect (conceptual — future extension)
+proc raceHandler(payload: BoxedValue,
+                 resume: proc(v: BoxedValue) {.gcsafe.},
+                 abort: proc(e: RtError) {.gcsafe.}) {.gcsafe.} =
   # Run all branches, collect evaluations
+  let branches = unboxBranches(payload)
   var evals: seq[Eval[T]]
   for b in branches:
     evals.add(interpret(b))
@@ -183,11 +200,13 @@ proc raceHandler(branches: seq[Eff[T]], resume: Resumption) =
   # Merge: join all truth values
   var merged = evalNeither[T]()
   for ev in evals:
-    merged = evalJoin(merged, ev)
+    merged = Eval[T](truth: join(merged.truth, ev.truth),
+                      value: if ev.value.isSome: ev.value else: merged.value,
+                      error: if ev.error.isSome: ev.error else: merged.error)
 
   case merged.truth
-  of tvTrue: resume.resume(merged.value.get)
-  of tvFalse: resume.abort(merged.error.get)
-  of tvBoth: resume.resolve(pickFirst(evals))  # handler decides
-  of tvNeither: resume.suspend()
+  of tvTrue: resume(boxValue(merged.value.get))
+  of tvFalse: abort(merged.error.get)
+  of tvBoth: resume(boxValue(pickFirst(evals)))  # handler decides
+  of tvNeither: discard  # implicit suspend — neither resume nor abort called
 ```

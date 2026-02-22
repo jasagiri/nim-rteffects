@@ -14,9 +14,9 @@ An algebraic effects system provides:
 1. **Effect declaration**: Define what operations are available
 2. **perform**: Request an effect (delegate to handler)
 3. **handle**: Install a handler that interprets effects
-4. **Resumption**: Handler controls whether to resume, abort, or suspend
+4. **Resumption control**: Handler controls whether to resume, abort, or suspend
 
-This is strictly more expressive than the current API — `spawn`, `sleep`, etc.
+This is strictly more expressive than the current API -- `spawn`, `sleep`, etc.
 become built-in effect handlers rather than hardcoded operations.
 
 ## Decision
@@ -25,7 +25,7 @@ Introduce algebraic effects as the primary user-facing API.
 
 ### Effect Declaration
 
-Effects are identified by `EffectTag` — a distinct string naming the effect:
+Effects are identified by `EffectTag` -- a distinct string naming the effect:
 
 ```nim
 type
@@ -43,21 +43,40 @@ const
   effFileRead* = EffectTag("file.read")
 ```
 
+### BoxedValue
+
+All payloads and handler values use `BoxedValue`, a type-erased sum type:
+
+```nim
+type
+  BoxedValueKind* = enum
+    bvNone, bvInt, bvStr, bvFloat, bvBool, bvRef, bvProgram
+
+  BoxedValue* = object
+    case kind*: BoxedValueKind
+    of bvNone: discard
+    of bvInt: intVal*: int
+    of bvStr: strVal*: string
+    of bvFloat: floatVal*: float
+    of bvBool: boolVal*: bool
+    of bvRef: refVal*: RootRef
+    of bvProgram:
+      innerProgram*: EffProgram
+      innerUnboxer*: proc(v: BoxedValue): BoxedValue {.gcsafe.}
+```
+
+Constructors: `boxInt(v)`, `boxStr(v)`, `boxFloat(v)`, `boxBool(v)`,
+`boxRef(v)`, `boxNone()`.
+
+Extractors: `unboxInt(v)`, `unboxStr(v)`, `unboxFloat(v)`, `unboxBool(v)`.
+
 ### perform
 
 `perform` creates an `opPerform` entry in the EffProgram. At runtime, the VM
 walks the handler stack (innermost first) looking for a matching tag:
 
 ```nim
-proc perform*[T](tag: EffectTag, payload: RootRef = nil): Eff[T]
-```
-
-App developer usage:
-```nim
-proc myTask(): Eff[string] {.rt.} =
-  let data = perform FileRead(path)  # .rt. macro expands this
-  let parsed = parse(data)
-  pure(parsed)
+proc perform*[T](tag: EffectTag, payload: BoxedValue = boxNone()): Eff[T]
 ```
 
 ### handle
@@ -65,40 +84,34 @@ proc myTask(): Eff[string] {.rt.} =
 `handle` wraps a computation with a handler for a specific effect:
 
 ```nim
-proc handle*[T](body: Eff[T], tag: EffectTag, h: HandlerProc): Eff[T]
-
-type
-  HandlerProc* = proc(payload: RootRef, resume: Resumption): RootRef {.gcsafe.}
+proc handle*[T](eff: Eff[T], tag: EffectTag, h: HandlerProc): Eff[T]
 ```
 
-Handler author usage:
-```nim
-let handled = handle(myTask(), effFileRead, proc(payload, resume) =
-  let path = unbox[string](payload)
-  let content = readFile(path)
-  resume.resume(box(content))  # resume computation with file content
-)
-```
+### HandlerProc
 
-### Resumption
-
-The handler receives a `Resumption` that controls computation flow:
+Handlers receive the payload and two inline closures -- `resume` and `abort` --
+directly. There is no `Resumption` object:
 
 ```nim
 type
-  Resumption* = object
-    resume*: proc(value: RootRef) {.gcsafe.}   ## Continue with value → T
-    abort*: proc(error: EffError) {.gcsafe.}    ## Fail computation → F
-    suspend*: proc() {.gcsafe.}                 ## Pause computation → N
+  HandlerProc* = proc(payload: BoxedValue,
+                       resume: proc(v: BoxedValue) {.gcsafe.},
+                       abort: proc(e: RtError) {.gcsafe.}) {.gcsafe, closure.}
 ```
 
-Handler authors see `TruthValue` through their choice of resumption operation:
-- `resume(v)` → evaluation becomes tvTrue
-- `abort(e)` → evaluation becomes tvFalse
-- `suspend()` → evaluation becomes tvNeither
+The error type is `RtError` (defined in `core.nim`).
 
-Future extension for speculative execution:
-- `fork(branches)` → evaluation may become tvBoth at merge
+Handler authors see `TruthValue` through their choice of which closure to call:
+
+| Action                           | TruthValue  | Meaning                        |
+|----------------------------------|-------------|--------------------------------|
+| Call `resume(v)`                 | tvTrue      | Continue computation with `v`  |
+| Call `abort(e)`                  | tvFalse     | Fail computation with `e`      |
+| Call neither                     | tvNeither   | Suspend (implicit)             |
+| Future: fork                     | tvBoth      | Speculative execution          |
+
+Suspension happens automatically when neither `resume` nor `abort` is called.
+There is no explicit `suspend()` proc.
 
 ### Handler Composition
 
@@ -115,9 +128,12 @@ let task = handle(
 ```
 
 When `myComputation` performs `effLog`, the inner handler matches.
-When it performs `effFileRead`, the VM walks past the log handler to the file handler.
+When it performs `effFileRead`, the VM walks past the log handler to the file
+handler.
 
-Unhandled effects produce `evalFalse(unhandledEffectError(tag))`.
+Internally, the VM walks `frame.handlers` from last to first (innermost first).
+
+Unhandled effects produce `RtError(kind: ForeignError, msg: "unhandled effect: " & $tag)`.
 
 ## Rationale
 
@@ -152,58 +168,86 @@ effect handlers compose naturally by nesting, with no lifting required.
 
 - All effects (including built-ins) are user-extensible and composable
 - Handlers enable dependency injection for testing
-- Resumption gives handler authors full control over computation flow
-- Handler authors can see and operate on 4-valued evaluation states
+- Inline closures give handler authors full control over computation flow
+- Handler authors can express 4-valued evaluation states through resume/abort/neither
 
 ### Negative
 
 - Dynamic handler dispatch (tag matching) has runtime overhead vs. direct calls
 - Handler stack walking is O(n) in handler depth per perform
-- Type safety is partially lost inside handlers (RootRef boxing)
+- Type safety is partially lost inside handlers (BoxedValue boxing)
 
 ### Neutral
 
-- The `.rt.` macro hides the complexity for app developers
 - Built-in effects (spawn, sleep) have the same API as user-defined effects
+- The `.rt.` macro is a planned future feature to hide handler plumbing for app developers
 
 ## Examples
 
 ### App developer (does not see 4-valued logic)
 
 ```nim
-proc fetchConfig(): Eff[Config] {.rt.} =
-  let raw = perform FileRead("config.json")
-  perform Log("Config loaded")
-  let config = parseConfig(raw)
-  pure(config)
+let effFileRead = EffectTag("file.read")
+let effLog = EffectTag("log")
+
+# Build a computation that performs effects
+let fetchConfig =
+  perform[string](effFileRead, boxStr("config.json"))
+    .andThen(proc(raw: string): Eff[string] =
+      perform[string](effLog, boxStr("Config loaded"))
+        .andThen(proc(_: string): Eff[string] =
+          pure(raw)  # return the raw config
+        )
+    )
 
 # Install handlers and run
+let fileHandler: HandlerProc = proc(payload: BoxedValue,
+    resume: proc(v: BoxedValue) {.gcsafe.},
+    abort: proc(e: RtError) {.gcsafe.}) {.gcsafe.} =
+  let path = unboxStr(payload)
+  let content = readFile(path)
+  resume(boxStr(content))
+
+let logHandler: HandlerProc = proc(payload: BoxedValue,
+    resume: proc(v: BoxedValue) {.gcsafe.},
+    abort: proc(e: RtError) {.gcsafe.}) {.gcsafe.} =
+  echo unboxStr(payload)
+  resume(boxNone())
+
 let result = run(
-  handle(handle(fetchConfig(),
-    effFileRead, fileSystemHandler),
-    effLog, stdoutLogHandler)
+  handle(handle(fetchConfig,
+    effFileRead, fileHandler),
+    effLog, logHandler)
 )
-# result: Result[Config]
+# result: Result[string]
 ```
 
-### Handler author (sees 4-valued states via Resumption)
+### Handler author (sees 4-valued states via resume/abort/neither)
 
 ```nim
-proc retryHandler(payload: RootRef, resume: Resumption) =
-  let req = unbox[HttpRequest](payload)
+let effHttpGet = EffectTag("http.get")
+let effCache = EffectTag("cache.get")
+
+# Retry handler: resume on success, abort after max retries
+let retryHandler: HandlerProc = proc(payload: BoxedValue,
+    resume: proc(v: BoxedValue) {.gcsafe.},
+    abort: proc(e: RtError) {.gcsafe.}) {.gcsafe.} =
+  let url = unboxStr(payload)
   for attempt in 0..<3:
     try:
-      let resp = httpGet(req.url)
-      resume.resume(box(resp))  # → tvTrue
+      let resp = httpGet(url)
+      resume(boxStr(resp))  # -> tvTrue
       return
     except:
       discard
-  resume.abort(EffError(kind: ekForeign, msg: "max retries"))  # → tvFalse
+  abort(RtError(kind: ForeignError, msg: "max retries"))  # -> tvFalse
 
-proc cachingHandler(payload: RootRef, resume: Resumption) =
-  let key = unbox[string](payload)
+# Caching handler: resume on hit, suspend on miss (implicit)
+let cachingHandler: HandlerProc = proc(payload: BoxedValue,
+    resume: proc(v: BoxedValue) {.gcsafe.},
+    abort: proc(e: RtError) {.gcsafe.}) {.gcsafe.} =
+  let key = unboxStr(payload)
   if cache.hasKey(key):
-    resume.resume(box(cache[key]))  # → tvTrue (from cache)
-  else:
-    resume.suspend()  # → tvNeither (need async fetch)
+    resume(boxStr(cache[key]))  # -> tvTrue (from cache)
+  # else: neither resume nor abort called -> tvNeither (suspended)
 ```

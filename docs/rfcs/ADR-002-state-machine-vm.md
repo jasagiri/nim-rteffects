@@ -28,6 +28,33 @@ For the redesigned effects system with 4-valued semantics, we need:
 Replace CPS callbacks with a **defunctionalized continuation table** executed
 by a **state machine VM**.
 
+### BoxedValue: Type-Erased Values
+
+Values flowing through the VM are wrapped in `BoxedValue`, a variant object
+that avoids `RootRef` casting for common types:
+
+```nim
+type
+  BoxedValueKind* = enum
+    bvNone, bvInt, bvStr, bvFloat, bvBool, bvRef, bvProgram
+
+  BoxedValue* = object
+    case kind*: BoxedValueKind
+    of bvNone: discard
+    of bvInt: intVal*: int
+    of bvStr: strVal*: string
+    of bvFloat: floatVal*: float
+    of bvBool: boolVal*: bool
+    of bvRef: refVal*: RootRef
+    of bvProgram:
+      innerProgram*: EffProgram  ## Nested program from andThen
+      innerUnboxer*: proc(v: BoxedValue): BoxedValue {.gcsafe.}
+```
+
+The `bvProgram` kind is critical for monadic bind (`andThen`): the `mapFn`
+closure returns a `BoxedValue(kind: bvProgram)` carrying a nested `EffProgram`.
+The engine resolves these via recursive `interpretStep`.
+
 ### EffProgram: The Continuation Table
 
 A computation is represented as a flat sequence of operations with explicit
@@ -41,29 +68,31 @@ type
     opPure       ## Return a value
     opFail       ## Return an error
     opBind       ## Sequence: run source, pass result to next
-    opMap        ## Transform current value
+    opMap        ## Transform current value with a function
     opPerform    ## Request effect handling
     opHandle     ## Install effect handler scope
 
   EffOp* = object
     case kind*: EffOpKind
     of opPure:
-      value*: RootRef
+      pureValue*: BoxedValue
     of opFail:
-      error*: EffError
+      failError*: RtError
     of opBind:
-      source*: ContId
-      next*: ContId
+      bindSource*: ContId   ## Run this first
+      bindNext*: ContId     ## Then continue here with result
     of opMap:
       mapTarget*: ContId
-      mapFn*: proc(v: RootRef): RootRef {.gcsafe, closure.}
+      mapFn*: proc(v: BoxedValue): BoxedValue {.gcsafe, closure.}
     of opPerform:
-      tag*: EffectTag
-      payload*: RootRef
+      performTag*: EffectTag
+      performPayload*: BoxedValue
     of opHandle:
-      body*: ContId
-      handlerTag*: EffectTag
-      handlerImpl*: HandlerProc
+      handleBody*: ContId
+      handleTag*: EffectTag
+      handleImpl*: proc(payload: BoxedValue,
+                        resume: proc(v: BoxedValue) {.gcsafe.},
+                        abort: proc(e: RtError) {.gcsafe.}) {.gcsafe, closure.}
 
   EffProgram* = object
     ops*: seq[EffOp]
@@ -72,75 +101,193 @@ type
 
 ### Frame: Execution State
 
-Each running computation has a Frame tracking its position in the program:
+Each running computation has a Frame tracking its position in the program.
+State transitions are governed by `StateMachine[FrameState, FrameEvent]`
+from the `actor-state-machine` library, providing validated transitions,
+history tracking, metrics, and observer support:
 
 ```nim
 type
   FrameId* = distinct int
+
   FrameState* = enum
     fsReady, fsRunning, fsSuspended, fsDone
 
+  FrameEvent* = enum
+    evDequeue   ## Ready -> Running: frame dequeued for execution
+    evYield     ## Running -> Ready: needs more steps, re-enqueue
+    evComplete  ## Running -> Done: computation finished
+    evSuspend   ## Running -> Suspended: blocked on effect
+    evResume    ## Suspended -> Ready: effect handler called resume
+
+  HandlerEntry* = object
+    tag*: EffectTag
+    impl*: proc(payload: BoxedValue,
+                resume: proc(v: BoxedValue) {.gcsafe.},
+                abort: proc(e: RtError) {.gcsafe.}) {.gcsafe, closure.}
+
   Frame* = object
     id*: FrameId
-    parentId*: FrameId
-    pc*: ContId               ## Program counter into EffProgram
-    program*: ptr EffProgram
-    state*: FrameState
-    eval*: RootRef            ## Current Eval[T]
-    handlerStack*: seq[HandlerEntry]
-    locals*: seq[RootRef]     ## Frame-local values
+    pc*: ContId
+    program*: EffProgram
+    sm*: StateMachine[FrameState, FrameEvent]
+    result*: BoxedValue
+    hasResult*: bool
+    failed*: bool
+    error*: RtError
+    handlers*: seq[HandlerEntry]
+    contStack*: seq[ContId]  ## Return address stack
 ```
+
+The state machine is initialized with explicit transition rules:
+
+```nim
+proc newFrameSM*(): StateMachine[FrameState, FrameEvent] =
+  result = newStateMachine[FrameState, FrameEvent](fsReady)
+  result.addTransition(fsReady, evDequeue, fsRunning)
+  result.addTransition(fsRunning, evYield, fsReady)
+  result.addTransition(fsRunning, evComplete, fsDone)
+  result.addTransition(fsRunning, evSuspend, fsSuspended)
+  result.addTransition(fsSuspended, evResume, fsReady)
+```
+
+### contStack: Return Address Mechanism
+
+Compound ops (`opBind`, `opMap`, `opHandle`) push their own `ContId` onto
+`contStack` before dispatching to a sub-expression. When a terminal op
+(`opPure`, `opFail`) or a completed compound op produces a result, it calls
+`completeOrReturn`, which pops `contStack` to return to the parent:
+
+```nim
+proc completeOrReturn(engine: Engine, frame: var Frame, frameId: int) =
+  if frame.contStack.len > 0:
+    frame.pc = frame.contStack.pop()
+    discard frame.sm.handleEvent(evYield)
+    engine.readyQ.addLast(frameId)
+  else:
+    discard frame.sm.handleEvent(evComplete)
+```
+
+This replaces the parent-child frame model. All execution happens within a
+single frame using the `contStack` as an intra-frame call stack.
 
 ### Engine: State Machine Loop
 
-The engine dequeues ready frames and executes one instruction per step:
+The engine dequeues ready frames and executes one instruction per step.
+State transitions use SM events instead of direct state assignment:
 
 ```nim
 proc step(engine: Engine): bool =
-  let frameId = engine.readyQ.dequeue()
+  let frameId = engine.readyQ.popFirst()
   var frame = engine.frames[frameId]
-  frame.state = fsRunning
+  discard frame.sm.handleEvent(evDequeue)  # Ready -> Running
 
   let op = frame.program.ops[frame.pc.int]
   case op.kind
   of opPure:
-    frame.eval = box(evalTrue(op.value))
-    frame.state = fsDone
+    frame.result = op.pureValue
+    frame.hasResult = true
+    completeOrReturn(engine, frame, frameId)
+
   of opFail:
-    frame.eval = box(evalFalse(op.error))
-    frame.state = fsDone
+    frame.error = op.failError
+    frame.failed = true
+    completeOrReturn(engine, frame, frameId)
+
   of opBind:
-    # Push source frame, set up continuation
-    let childId = engine.newFrame(frame.id, op.source)
-    engine.enqueue(childId)
-    frame.state = fsSuspended  # wait for child
-    frame.pc = op.next         # resume here after child completes
+    if frame.hasResult:
+      if frame.result.kind == bvProgram:
+        # Resolve nested program from andThen
+        let inner = engine.interpretStep(
+          frame.result.innerProgram, frame.result.innerProgram.entry)
+        if inner.failed:
+          frame.error = inner.error
+          frame.failed = true
+          frame.hasResult = false
+          completeOrReturn(engine, frame, frameId)
+        elif inner.hasResult:
+          frame.result = inner.result
+          discard frame.sm.handleEvent(evYield)
+          engine.readyQ.addLast(frameId)
+        else:
+          discard frame.sm.handleEvent(evSuspend)
+      else:
+        frame.pc = op.bindNext
+        discard frame.sm.handleEvent(evYield)
+        engine.readyQ.addLast(frameId)
+    elif frame.failed:
+      completeOrReturn(engine, frame, frameId)
+    else:
+      frame.contStack.add(frame.pc)
+      frame.pc = op.bindSource
+      discard frame.sm.handleEvent(evYield)
+      engine.readyQ.addLast(frameId)
+
   of opPerform:
-    # Walk handler stack, find matching handler
-    engine.dispatchEffect(frame, op.tag, op.payload)
+    let idx = findHandler(frame, op.performTag)
+    if idx < 0:
+      frame.error = RtError(kind: ForeignError,
+        msg: "unhandled effect: " & $op.performTag)
+      frame.failed = true
+      completeOrReturn(engine, frame, frameId)
+    else:
+      var resumed = false
+      var resumeValue: BoxedValue
+      var aborted = false
+      var abortError: RtError
+      frame.handlers[idx].impl(
+        op.performPayload,
+        proc(v: BoxedValue) {.gcsafe.} =
+          resumed = true; resumeValue = v,
+        proc(e: RtError) {.gcsafe.} =
+          aborted = true; abortError = e,
+      )
+      if resumed:
+        frame.result = resumeValue
+        frame.hasResult = true
+        completeOrReturn(engine, frame, frameId)
+      elif aborted:
+        frame.error = abortError
+        frame.failed = true
+        completeOrReturn(engine, frame, frameId)
+      else:
+        discard frame.sm.handleEvent(evSuspend)
+
   of opHandle:
-    frame.handlerStack.add(HandlerEntry(tag: op.handlerTag, impl: op.handlerImpl))
-    frame.pc = op.body
-    engine.enqueue(frame.id)
+    if frame.hasResult or frame.failed:
+      completeOrReturn(engine, frame, frameId)
+    else:
+      frame.handlers.add(HandlerEntry(
+        tag: op.handleTag, impl: op.handleImpl))
+      frame.contStack.add(frame.pc)
+      frame.pc = op.handleBody
+      discard frame.sm.handleEvent(evYield)
+      engine.readyQ.addLast(frameId)
+
   of opMap:
-    let childId = engine.newFrame(frame.id, op.mapTarget)
-    engine.enqueue(childId)
-    # ... transform result when child completes
+    if frame.hasResult:
+      frame.result = op.mapFn(frame.result)
+      completeOrReturn(engine, frame, frameId)
+    elif frame.failed:
+      completeOrReturn(engine, frame, frameId)
+    else:
+      frame.contStack.add(frame.pc)
+      frame.pc = op.mapTarget
+      discard frame.sm.handleEvent(evYield)
+      engine.readyQ.addLast(frameId)
 ```
 
-### InternalJump: Low-Frequency Escape
+### Handler Signature
 
-For rare cases (fatal errors, deep unwinding), an exception-based jump:
+Handlers receive the payload and two inline closures -- `resume` and `abort` --
+rather than a `Resumption` object. The handler calls exactly one of them to
+continue execution, or calls neither to suspend the frame:
 
 ```nim
-type
-  InternalJump* = object of CatchableError
-    targetFrame*: FrameId
-    reason*: string
+proc(payload: BoxedValue,
+     resume: proc(v: BoxedValue) {.gcsafe.},
+     abort: proc(e: RtError) {.gcsafe.}) {.gcsafe, closure.}
 ```
-
-This is **never exposed** in any public API. `{.raises: [].}` on all public procs
-guarantees this statically.
 
 ## Rationale
 
@@ -152,40 +299,62 @@ guarantees this statically.
 | Inspectability | Opaque procs | Structured data |
 | Tracing | Requires hooks | Natural (walk ops) |
 | Serialization | Impossible | Possible (minus closures) |
-| Suspension | Complex (save closure) | Natural (save pc + locals) |
+| Suspension | Complex (save closure) | Natural (save pc + contStack) |
+| Type erasure | RootRef casts | BoxedValue variant |
 
 ### vs. Bytecode VM
 
 A full bytecode VM would compile Nim expressions into instructions. This is
-overengineering — we only need to represent the **control flow structure**
+overengineering -- we only need to represent the **control flow structure**
 (bind, perform, handle), not arbitrary computation. Leaf operations (value
-transformations) remain as Nim procs via `mapFn` and `handlerImpl`.
+transformations) remain as Nim procs via `mapFn` and `handleImpl`.
 
 ### vs. Free monad (ref object tree)
 
 A free monad tree (`Pure | Bind | Perform | Handle`) would be recursive ref
-objects — similar allocation pressure to CPS. The continuation table is a
+objects -- similar allocation pressure to CPS. The continuation table is a
 flattened form of the same structure.
+
+### Why BoxedValue over RootRef
+
+`RootRef` requires heap allocation and unsafe downcasting for every value.
+`BoxedValue` stores common types (`int`, `string`, `float`, `bool`) inline
+in the variant, avoiding allocation. The `bvRef` branch preserves `RootRef`
+as an escape hatch. The `bvProgram` branch enables monadic composition without
+a separate mechanism.
+
+### Why SM events over direct state assignment
+
+Using `StateMachine[FrameState, FrameEvent]` provides:
+- **Validated transitions**: invalid transitions (e.g., `fsDone -> fsRunning`)
+  are caught immediately instead of silently corrupting state
+- **Transition history**: debuggable trace of all state changes
+- **Observer hooks**: external systems can subscribe to frame lifecycle events
+- **Metrics**: automatic counting of transitions for performance analysis
 
 ## Consequences
 
 ### Positive
 
 - Program structure is inspectable data, enabling tracing and debugging
-- Frame suspension/resumption is natural (save/restore pc + locals)
+- Frame suspension/resumption is natural (save/restore pc + contStack)
 - Budget-based preemption works by counting steps, not estimating closure depth
 - Handler dispatch walks a data structure, not a closure chain
 - Memory layout is cache-friendly (sequential ops in seq)
+- BoxedValue avoids heap allocation for primitive types
+- State machine validates all frame transitions at runtime
+- `bvProgram` enables recursive program resolution for monadic bind
 
 ### Negative
 
-- Value transformations still require closures (`mapFn`, `handlerImpl`)
-- Type erasure via `RootRef` loses compile-time type safety inside the VM
+- Value transformations still require closures (`mapFn`, `handleImpl`)
+- Type erasure via `BoxedValue` loses compile-time type safety inside the VM
 - The builder API must manage ContId linking correctly
+- `bvProgram` resolution via recursive `interpretStep` adds stack depth
 
 ### Neutral
 
-- Complexity moves from closure management to table management — roughly equivalent
+- Complexity moves from closure management to table management -- roughly equivalent
 - The `.rt.` macro output changes from nested procs to EffProgram construction
 
 ## Examples
@@ -213,11 +382,74 @@ proc task(rt: ptr Runtime, k: Cont[int]) =
 # Generates:
 EffProgram(
   ops: @[
-    EffOp(kind: opBind, source: ContId(1), next: ContId(2)),  # [0] entry
-    EffOp(kind: opPure, value: box(1)),                        # [1] source
-    EffOp(kind: opMap, mapTarget: ContId(1),                   # [2] continuation
-          mapFn: proc(v: RootRef): RootRef = box(unbox[int](v) + 1))
+    EffOp(kind: opPure, pureValue: boxInt(1)),           # [0] source
+    EffOp(kind: opMap, mapTarget: ContId(0),              # [1] andThen continuation
+          mapFn: proc(v: BoxedValue): BoxedValue =
+            # Returns bvProgram carrying pure(unboxInt(v) + 1)
+            let inner = pure(unboxInt(v) + 1)
+            BoxedValue(kind: bvProgram,
+              innerProgram: inner.program,
+              innerUnboxer: ...)),
+    EffOp(kind: opBind, bindSource: ContId(0),            # [2] entry
+          bindNext: ContId(1)),
   ],
-  entry: ContId(0)
+  entry: ContId(2)
 )
+```
+
+### Effect handling
+
+```nim
+# perform(readTag).handle(readTag, handler)
+# Generates:
+EffProgram(
+  ops: @[
+    EffOp(kind: opPerform,                                # [0] effect request
+          performTag: EffectTag("read"),
+          performPayload: boxNone()),
+    EffOp(kind: opHandle,                                 # [1] entry
+          handleBody: ContId(0),
+          handleTag: EffectTag("read"),
+          handleImpl: proc(payload: BoxedValue,
+                           resume: proc(v: BoxedValue) {.gcsafe.},
+                           abort: proc(e: RtError) {.gcsafe.}) =
+            resume(boxStr("file contents"))),
+  ],
+  entry: ContId(1)
+)
+```
+
+### Execution trace
+
+For `pure(1).andThen(x => pure(x + 1))`:
+
+```
+step 1: dequeue frame, evDequeue (Ready -> Running)
+         pc=2 (opBind), first visit -> push ContId(2) onto contStack
+         set pc=0 (bindSource), evYield (Running -> Ready)
+
+step 2: dequeue frame, evDequeue (Ready -> Running)
+         pc=0 (opPure), result=boxInt(1), hasResult=true
+         contStack.pop -> pc=2, evYield (Running -> Ready)
+
+step 3: dequeue frame, evDequeue (Ready -> Running)
+         pc=2 (opBind), hasResult=true, plain value
+         set pc=1 (bindNext), evYield (Running -> Ready)
+
+step 4: dequeue frame, evDequeue (Ready -> Running)
+         pc=1 (opMap), first visit -> push ContId(1) onto contStack
+         set pc=0 (mapTarget), evYield (Running -> Ready)
+
+step 5: dequeue frame, evDequeue (Ready -> Running)
+         pc=0 (opPure), result=boxInt(1), hasResult=true
+         contStack.pop -> pc=1, evYield (Running -> Ready)
+
+step 6: dequeue frame, evDequeue (Ready -> Running)
+         pc=1 (opMap), hasResult=true -> apply mapFn
+         result=BoxedValue(kind: bvProgram, ...)
+         contStack empty -> evComplete (Running -> Done)
+
+step 7: engine detects bvProgram, calls interpretStep recursively
+         inner program: pure(2) -> result=boxInt(2)
+         final result: boxInt(2)
 ```

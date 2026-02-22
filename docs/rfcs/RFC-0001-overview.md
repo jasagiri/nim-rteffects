@@ -3,9 +3,13 @@
 ## Status
 
 - [x] Draft
-- [ ] Review
-- [ ] Accepted
+- [x] Review
+- [x] Accepted
 - [ ] Superseded
+
+Core modules (core, semantics, algebra, vm/types, vm/engine) have been
+implemented. Concurrency primitives remain in the v1 runtime and are planned
+for future migration.
 
 ## Summary
 
@@ -73,15 +77,20 @@ continuation table represents the same control flow as flat data:
          │ effects interpreted by handlers
 ┌────────▼────────────────────────────────────┐
 │  Handler Semantics (handler author)         │
-│  TruthValue, Eval[T], Resumption            │
-│  resume / abort / suspend / fork / resolve  │
+│  TruthValue, Eval[T], resume/abort closures │
+│  Handler receives:                          │
+│    (payload: BoxedValue,                    │
+│     resume: proc(v: BoxedValue),            │
+│     abort: proc(e: RtError))               │
+│  suspend = neither resume nor abort called  │
 │  → Operates on 4-valued evaluation states   │
 └────────┬────────────────────────────────────┘
          │ Eval[T] flows through VM
 ┌────────▼────────────────────────────────────┐
 │  VM Execution (internal)                    │
-│  Frame, EffProgram, Scheduler               │
+│  Frame, EffProgram, Engine                  │
 │  Defunctionalized continuation table        │
+│  StateMachine[FrameState, FrameEvent]       │
 │  → Completely hidden from users             │
 └────────┬────────────────────────────────────┘
          │ Eval[T] → Result[T] (ACL)
@@ -90,6 +99,7 @@ continuation table represents the same control flow as flat data:
 │  run(): Result[T]                           │
 │  → The only place 2-valued appears          │
 │  → EXIT of the effects system, not the API  │
+│  → Lives in vm/engine.nim (runner ACL)      │
 └─────────────────────────────────────────────┘
 ```
 
@@ -97,29 +107,65 @@ continuation table represents the same control flow as flat data:
 
 ```
 src/rteffects/
-├── semantics.nim     # TruthValue, Belnap lattice, Eval[T]
-├── algebra.nim       # Eff[T], pure, andThen, perform, handle (builder API)
-├── vm/
-│   ├── types.nim     # EffOp, EffProgram, ContId, Frame, Resumption
-│   ├── engine.nim    # State machine main loop, interpret
-│   └── scheduler.nim # ReadyQueue, task lifecycle
-├── runner.nim        # ACL: run() collapses Eval[T] → Result[T]
-├── trace.nim         # TraceEvent, Snapshot (observability)
-├── core.nim          # EffError, Result[T], TaskId (foundation)
-├── nursery.nim       # Structured concurrency (effect handler)
-├── channel.nim       # Inter-task communication (effect handler)
-├── sync.nim          # Semaphore, Mutex (effect handler)
-└── cps.nim           # .rt. macro (syntax sugar over algebra.nim)
+├── core.nim          # RtError, Result[T], TaskId (shared kernel)
+├── semantics.nim     # TruthValue, Eval[T], Belnap lattice operations
+├── algebra.nim       # Eff[T], pure, andThen, map, perform, handle
+└── vm/
+    ├── types.nim     # EffOp, EffProgram, ContId, BoxedValue, EffectTag
+    └── engine.nim    # Frame, Engine, interpret, run (includes runner ACL)
 ```
+
+**Planned future modules** (not yet implemented):
+
+| Module | Purpose |
+|--------|---------|
+| `runner.nim` | Standalone runner with configurable collapse strategies |
+| `scheduler.nim` | ReadyQueue, multi-frame task lifecycle |
+| `trace.nim` | TraceEvent, Snapshot (observability) |
+| `nursery.nim` | Structured concurrency (as v2 effect handler) |
+| `channel.nim` | Inter-task communication (as v2 effect handler) |
+| `sync.nim` | Semaphore, Mutex (as v2 effect handler) |
+| `cps.nim` | `.rt.` macro (syntax sugar over algebra.nim) |
+
+Note: `nursery.nim` and `cps.nim` exist as v1 modules built on `runtime.nim`.
+They will be reimplemented as v2 effect handlers in a future iteration.
 
 ### Key Principle: Result[T] is the EXIT, not the API
 
 ```
 User writes:   perform FileRead("config.json")
-Handler sees:  TruthValue + resume/abort/suspend
-VM executes:   Frame state transitions on EffProgram
+Handler sees:  BoxedValue + resume/abort closures (→ TruthValue implicitly)
+VM executes:   Frame state transitions on EffProgram (StateMachine[FrameState, FrameEvent])
 Runner exits:  Result[T] (the only 2-valued boundary)
 ```
+
+## Key Types
+
+### RtError
+
+The shared error type across the system. Supports error chaining (`cause`),
+aggregate errors (`children`), and Belnap-specific error kinds (`Contradiction`,
+`Incomplete`) for when 4-valued states collapse to 2-valued at the runner boundary.
+
+### BoxedValue
+
+The VM uses `BoxedValue` (a variant object) instead of `RootRef` for type-erased
+values. This avoids heap allocation for common scalar types:
+
+```nim
+BoxedValueKind = enum
+  bvNone, bvInt, bvStr, bvFloat, bvBool, bvRef, bvProgram
+```
+
+The `bvProgram` variant carries a nested `EffProgram` for `andThen` chains,
+allowing the engine to resolve inner programs without circular imports.
+
+## External Dependencies
+
+- **`actor_state_machine`** (`state_machine` import): Provides
+  `StateMachine[FrameState, FrameEvent]` for Frame lifecycle management.
+  The Frame state machine validates transitions between `fsReady`, `fsRunning`,
+  `fsSuspended`, and `fsDone`, with history tracking and metrics.
 
 ## Key Decisions
 
@@ -131,8 +177,8 @@ Runner exits:  Result[T] (the only 2-valued boundary)
 
 ## Migration Path
 
-1. Build new modules alongside existing code (v1 untouched)
-2. New tests validate v2 modules independently
+1. Build new modules alongside existing code (v1 untouched) — **done**
+2. New tests validate v2 modules independently — **done**
 3. Create compatibility layer: `Task[T] = Eff[T]`, `runDefault = run`
 4. Existing test suite validates backward compatibility
 5. Gradually migrate high-level patterns (nursery, channel, sync)
