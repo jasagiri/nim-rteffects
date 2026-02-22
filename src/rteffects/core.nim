@@ -13,7 +13,9 @@ type
     Cancelled,
     ExceptionRaised,
     ForeignError,
-    AggregateError  ## Multiple errors collected
+    AggregateError,  ## Multiple errors collected
+    Contradiction,   ## Belnap tvBoth collapsed to 2-valued
+    Incomplete       ## Belnap tvNeither collapsed to 2-valued
 
   RtError* = object
     kind*: RtErrorKind

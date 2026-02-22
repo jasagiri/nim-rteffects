@@ -1,9 +1,16 @@
 ## Belnap 4-valued evaluation semantics.
 ##
 ## Provides TruthValue {tvTrue, tvFalse, tvBoth, tvNeither} forming
-## a De Morgan lattice with information ordering.
+## a bilattice with knowledge and truth orderings.
 ##
-## This module is pure math — no side effects, no runtime dependency.
+## Eval[T] wraps a computation result with its TruthValue, providing
+## the 4-valued evaluation type that collapses to Result[T] at the
+## runner boundary.
+##
+## This module is pure — no side effects, no runtime dependency.
+
+import std/options
+import ./core
 
 type
   TruthValue* = enum
@@ -64,3 +71,74 @@ proc negate*(a: TruthValue): TruthValue {.raises: [].} =
 proc leqI*(a, b: TruthValue): bool {.raises: [].} =
   ## Information ordering: a <=i b iff join(a, b) == b.
   join(a, b) == b
+
+# --- Eval[T]: 4-valued evaluation result ---
+
+type
+  Eval*[T] = object
+    ## A computation result with 4-valued truth.
+    ## Invariants:
+    ##   tvTrue    → value.isSome, error.isNone
+    ##   tvFalse   → value.isNone, error.isSome
+    ##   tvBoth    → value.isSome, error.isSome
+    ##   tvNeither → value.isNone, error.isNone
+    truth*: TruthValue
+    value*: Option[T]
+    error*: Option[RtError]
+
+proc evalTrue*[T](v: T): Eval[T] {.raises: [].} =
+  Eval[T](truth: tvTrue, value: some(v), error: none(RtError))
+
+proc evalFalse*[T](e: RtError): Eval[T] {.raises: [].} =
+  Eval[T](truth: tvFalse, value: none(T), error: some(e))
+
+proc evalBoth*[T](v: T, e: RtError): Eval[T] {.raises: [].} =
+  Eval[T](truth: tvBoth, value: some(v), error: some(e))
+
+proc evalNeither*[T](): Eval[T] {.raises: [].} =
+  Eval[T](truth: tvNeither, value: none(T), error: none(RtError))
+
+proc map*[T, U](ev: Eval[T], f: proc(v: T): U): Eval[U] =
+  ## Transform the value if present (tvTrue or tvBoth).
+  ## Error and truth are preserved.
+  case ev.truth
+  of tvTrue:
+    evalTrue(f(ev.value.get))
+  of tvFalse:
+    evalFalse[U](ev.error.get)
+  of tvBoth:
+    evalBoth(f(ev.value.get), ev.error.get)
+  of tvNeither:
+    evalNeither[U]()
+
+proc flatMap*[T, U](ev: Eval[T], f: proc(v: T): Eval[U]): Eval[U] =
+  ## Chain evaluation. Only invokes f when value is present (tvTrue or tvBoth).
+  ## For tvBoth, the inner result's truth is joined with tvBoth.
+  case ev.truth
+  of tvTrue:
+    f(ev.value.get)
+  of tvFalse:
+    evalFalse[U](ev.error.get)
+  of tvBoth:
+    let inner = f(ev.value.get)
+    # Preserve the contradictory nature: join truth values
+    Eval[U](
+      truth: join(tvBoth, inner.truth),
+      value: inner.value,
+      error: if inner.error.isSome: inner.error else: ev.error,
+    )
+  of tvNeither:
+    evalNeither[U]()
+
+proc toResult*[T](ev: Eval[T]): Result[T] {.raises: [].} =
+  ## ACL: collapse 4-valued Eval to 2-valued Result.
+  ## This is the EXIT of the effects system.
+  case ev.truth
+  of tvTrue:
+    ok[T](ev.value.get)
+  of tvFalse:
+    err[T](ev.error.get)
+  of tvBoth:
+    err[T](RtError(kind: Contradiction, msg: "contradictory evaluation"))
+  of tvNeither:
+    err[T](RtError(kind: Incomplete, msg: "incomplete evaluation"))
