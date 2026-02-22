@@ -119,16 +119,20 @@ proc andThen*[T, U](eff: Eff[T], f: proc(v: T): Eff[U] {.gcsafe.}): Eff[U] =
   # For now, we use opBind with a dynamically created continuation
   let capturedF = f
   let capturedUnboxer = eff.unboxer
+  let capturedResultUnboxer = defaultUnboxer[U]
 
-  # Add a map-like node that invokes f and merges the resulting program
+  # Add a map-like node that invokes f and returns a bvProgram
   let nextId = result.program.addOp(EffOp(kind: opMap,
     mapTarget: sourceEntry,
     mapFn: proc(v: BoxedValue): BoxedValue {.gcsafe.} =
       # At interpretation time, f(unbox(v)) produces an Eff[U]
-      # The engine must handle this specially for andThen
       let innerEff = capturedF(capturedUnboxer(v))
-      # Pack the inner Eff reference for the engine
-      boxRef(innerEff),
+      # Pack the inner program for the engine (no circular import needed)
+      BoxedValue(kind: bvProgram,
+        innerProgram: innerEff.program,
+        innerUnboxer: proc(bv: BoxedValue): BoxedValue {.gcsafe.} =
+          defaultBoxer(capturedResultUnboxer(bv)),
+      ),
   ))
 
   # The entry is a bind: run source, then continuation

@@ -16,7 +16,7 @@ type
   # --- Boxing for type-erased values ---
 
   BoxedValueKind* = enum
-    bvNone, bvInt, bvStr, bvFloat, bvBool, bvRef
+    bvNone, bvInt, bvStr, bvFloat, bvBool, bvRef, bvProgram
 
   BoxedValue* = object
     ## Type-erased value for the continuation table.
@@ -27,6 +27,9 @@ type
     of bvFloat: floatVal*: float
     of bvBool: boolVal*: bool
     of bvRef: refVal*: RootRef
+    of bvProgram:
+      innerProgram*: EffProgram  ## Nested program from andThen
+      innerUnboxer*: proc(v: BoxedValue): BoxedValue {.gcsafe.}
 
   # --- Continuation table operations ---
 
