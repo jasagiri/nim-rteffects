@@ -7,8 +7,10 @@ import rteffects/core
 import rteffects/vm/types
 import rteffects/algebra
 import rteffects/vm/engine
+import rteffects/handlers
 
 export core
 export types
 export algebra
 export engine
+export handlers

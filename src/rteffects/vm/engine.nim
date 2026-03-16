@@ -356,3 +356,34 @@ proc run*[T](eff: Eff[T], budget = 10000): Result[T] {.raises: [].} =
     toResult(ev)
   except Exception as e:
     err[T](RtError(kind: ExceptionRaised, msg: e.msg))
+
+# ---------------------------------------------------------------------------
+# Async resume API: for handlers that defer resume to a later callback
+# ---------------------------------------------------------------------------
+
+proc resumeFrame*(engine: Engine, frameId: int, value: BoxedValue) =
+  ## Resume a suspended frame with a value (called from async I/O callback).
+  ## Sets result and returns control to the continuation stack.
+  if frameId >= engine.frames.len: return
+  if engine.frames[frameId].state != fsSuspended: return
+  engine.frames[frameId].result = value
+  engine.frames[frameId].hasResult = true
+  completeOrReturn(engine, engine.frames[frameId], frameId)
+
+proc abortFrame*(engine: Engine, frameId: int, error: RtError) =
+  ## Abort a suspended frame with an error (called from async I/O callback).
+  if frameId >= engine.frames.len: return
+  if engine.frames[frameId].state != fsSuspended: return
+  engine.frames[frameId].error = error
+  engine.frames[frameId].failed = true
+  completeOrReturn(engine, engine.frames[frameId], frameId)
+
+proc hasSuspended*(engine: Engine): bool =
+  ## Check if any frames are suspended (waiting for async I/O).
+  for f in engine.frames:
+    if f.state == fsSuspended: return true
+  false
+
+proc allDone*(engine: Engine): bool =
+  ## Check if all frames are done (no work remaining).
+  engine.queueLen == 0 and not engine.hasSuspended()
