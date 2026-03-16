@@ -4,7 +4,7 @@ RTEffects v2 is an algebraic effects system for Nim with Belnap 4-valued logic. 
 
 ## Requirements
 
-- Nim >= 2.0.0
+- Nim >= 2.2.8
 - `actor-state-machine` (sibling package, for VM state management)
 
 ## Installation
@@ -30,8 +30,9 @@ The library is organised into three tiers:
 | **Tier 1** — App developer | `Eff[T]`, `pure`, `fail`, `andThen`, `map`, `run` | `rteffects/algebra`, `rteffects/vm/engine` |
 | **Tier 2** — Handler author | `perform`, `handle`, `EffectTag`, `BoxedValue`, `HandlerProc` | `rteffects/algebra`, `rteffects/vm/types` |
 | **Tier 3** — Semantics | `TruthValue`, `Eval[T]`, `interpret` | `rteffects/semantics`, `rteffects/vm/engine` |
+| **Standard handlers** | `performHttpGet`, `mockHttpGetHandler`, `deferredHttpGetHandler`, ... | `rteffects/handlers` (or `rteffects`) |
 
-Most application code only needs Tier 1.
+Most application code only needs Tier 1. For HTTP/file I/O effects, `import rteffects` gives access to all tiers including the standard handlers.
 
 ## Basic Concepts
 
@@ -242,6 +243,27 @@ of tvNeither: echo "no information yet (incomplete)"
 ```
 
 `Eval[T]` carries a `truth: TruthValue`, an `value: Option[T]`, and an `error: Option[RtError]`.
+
+## Standard Handlers
+
+The `handlers` module provides ready-to-use effect tags and handler implementations for HTTP and file I/O. Three variants are available per effect:
+
+- **Sync** — Blocking, for simple scripts (`syncHttpGetHandler`, `syncFileReadHandler`, ...)
+- **Mock** — URL/path substring matching, for testing (`mockHttpGetHandler`, `mockFileReadHandler`)
+- **Deferred** — Suspends the frame, for async I/O with `Engine` (`deferredHttpGetHandler`, ...)
+
+```nim
+import rteffects
+
+# Perform an HTTP GET with a mock handler (for testing)
+let eff = performHttpGet("https://api.example.com/data")
+let handled = handle[string](eff, httpGetTag,
+  mockHttpGetHandler(@[("api.example.com", "{\"ok\":true}")]).impl)
+let result = run[string](handled)
+echo result.ok  # {"ok":true}
+```
+
+For async patterns using deferred handlers, see [Patterns — Async Resume](patterns.md#6-async-resume-pattern).
 
 ## Next Steps
 

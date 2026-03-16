@@ -430,6 +430,165 @@ Collapses an `Eval[T]` to a classical `Result[T]`:
 
 ---
 
+## Standard Handlers
+
+Import path: `rteffects/handlers`
+
+The handlers module provides ready-to-use effect tags and handler implementations for common I/O operations (HTTP, file system). Three handler variants are available for each effect: sync (blocking), mock (testing), and deferred (async).
+
+`import rteffects` re-exports this module automatically.
+
+---
+
+### Effect Tags
+
+```nim
+const httpGetTag*  = EffectTag("http:get")   ## HTTP GET request
+const httpPostTag* = EffectTag("http:post")  ## HTTP POST request
+const fileReadTag* = EffectTag("file:read")  ## File read
+const fileWriteTag* = EffectTag("file:write") ## File write
+```
+
+---
+
+### Typed Perform Wrappers
+
+```nim
+proc performHttpGet*(url: string): Eff[string]
+```
+Perform HTTP GET. Payload: URL string. Resume value: response body.
+
+```nim
+proc performHttpPost*(url: string, body: string): Eff[string]
+```
+Perform HTTP POST. Payload encodes URL and body separated by newline. Resume value: response body.
+
+```nim
+proc performFileRead*(path: string): Eff[string]
+```
+Read a file. Payload: file path. Resume value: file content.
+
+```nim
+proc performFileWrite*(path: string, content: string): Eff[string]
+```
+Write a file. Payload encodes path and content separated by newline. Resume value: empty string on success.
+
+---
+
+### Sync Handlers
+
+Blocking handlers using `std/httpclient` and `readFile`/`writeFile`. Suitable for simple scripts.
+
+```nim
+proc syncHttpGetHandler*(): HandlerEntry
+proc syncHttpPostHandler*(): HandlerEntry
+proc syncFileReadHandler*(): HandlerEntry
+proc syncFileWriteHandler*(): HandlerEntry
+```
+
+Each returns a `HandlerEntry` with `tag` and `impl` fields. Pass `.impl` to `handle`.
+
+---
+
+### Mock Handlers
+
+For testing. Match by URL/path substring.
+
+```nim
+proc mockHttpGetHandler*(responses: seq[(string, string)]): HandlerEntry
+```
+Returns the response body for the first `(pattern, body)` pair where `pattern` is a substring of the request URL. Aborts if no match.
+
+```nim
+proc mockFileReadHandler*(files: seq[(string, string)]): HandlerEntry
+```
+Returns the content for the first `(pattern, content)` pair where `pattern` is a substring of the file path. Aborts if no match.
+
+---
+
+### Deferred Handlers
+
+For Engine-based async I/O. The handler does **not** call `resume`; the frame goes to `fsSuspended`. The caller is responsible for calling `engine.resumeFrame(fid, value)` or `engine.abortFrame(fid, error)` later.
+
+```nim
+proc deferredHttpGetHandler*(): HandlerEntry
+proc deferredHttpPostHandler*(): HandlerEntry
+proc deferredFileReadHandler*(): HandlerEntry
+```
+
+---
+
+### Usage Example
+
+```nim
+import rteffects
+
+# With mock handler (testing)
+let eff = performHttpGet("https://api.example.com/data")
+let result = run[string](handle[string](eff, httpGetTag,
+  mockHttpGetHandler(@[("api.example.com", "{\"ok\":true}")]).impl))
+
+# With deferred handler (async)
+let engine = newEngine(budget = 100)
+let eff2 = handle[string](performHttpGet("https://slow.api"), httpGetTag,
+  deferredHttpGetHandler().impl)
+let fid = engine.newFrame(eff2.program, eff2.program.entry)
+engine.runLoop()
+# ... later, when I/O completes:
+engine.resumeFrame(fid, boxStr("response body"))
+engine.runLoop()
+```
+
+---
+
+## Async Resume API (Engine)
+
+Import path: `rteffects/vm/engine`
+
+These procedures allow external code (async I/O callbacks, event loops) to resume or abort suspended frames.
+
+---
+
+### `resumeFrame`
+
+```nim
+proc resumeFrame*(engine: Engine, frameId: int, value: BoxedValue)
+```
+
+Resume a suspended frame with a value. The frame must be in `fsSuspended` state. Sets the frame's result and returns control to the continuation stack. No-op if the frame ID is invalid or the frame is not suspended.
+
+---
+
+### `abortFrame`
+
+```nim
+proc abortFrame*(engine: Engine, frameId: int, error: RtError)
+```
+
+Abort a suspended frame with an error. The frame must be in `fsSuspended` state. Sets the frame's error and propagates failure through the continuation stack. No-op if the frame ID is invalid or the frame is not suspended.
+
+---
+
+### `hasSuspended`
+
+```nim
+proc hasSuspended*(engine: Engine): bool
+```
+
+Returns `true` if any frames are in `fsSuspended` state (waiting for async I/O).
+
+---
+
+### `allDone`
+
+```nim
+proc allDone*(engine: Engine): bool
+```
+
+Returns `true` if the ready queue is empty and no frames are suspended. Indicates all work is complete.
+
+---
+
 ## Tier 4: VM Internals
 
 Import paths: `rteffects/vm/types`, `rteffects/vm/engine`
@@ -506,6 +665,7 @@ Allocates a new `Engine` with the given step budget.
 |--------|-------------|------|
 | Core types and error constructors | `rteffects/core` | 1 |
 | Effect algebra (`Eff`, `pure`, `fail`, `andThen`, `map`, `run`, `perform`, `handle`) | `rteffects/algebra` | 1, 2 |
+| Standard handlers (HTTP, File I/O, mock, deferred) | `rteffects/handlers` | 1, 2 |
 | Four-valued semantics (`Eval`, `TruthValue`, `interpret`) | `rteffects/semantics` | 3 |
 | VM value representation (`BoxedValue`, `EffProgram`, `EffOp`) | `rteffects/vm/types` | 2, 4 |
-| VM execution engine (`Engine`, `Frame`) | `rteffects/vm/engine` | 4 |
+| VM execution engine (`Engine`, `Frame`, `resumeFrame`, `abortFrame`) | `rteffects/vm/engine` | 4 |

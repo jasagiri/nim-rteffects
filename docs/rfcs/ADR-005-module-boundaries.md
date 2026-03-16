@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted (updated 2026-02-22 to match current implementation)
+Accepted (updated 2026-03-17 to reflect handlers.nim and current module layout)
 
 ## Context
 
@@ -32,12 +32,19 @@ owns its terms and communicates through explicit boundaries (ACL or Shared Kerne
 | Evaluation Semantics | `semantics.nim` | TruthValue, Eval[T], join, meet, negate, leqI |
 | VM Execution | `vm/types.nim`, `vm/engine.nim` | Frame, EffProgram, ContId, BoxedValue, Engine |
 | Type Safety | `core.nim` | RtError, Result[T], TaskId |
+| Standard I/O Handlers | `handlers.nim` | HttpHandler, FileHandler, MockHandler, DeferredHandler |
 
-High-level patterns (nursery, channel, sync) will be effect handlers built on
-top of the algebra and VM. These are planned but not yet implemented:
+Standard I/O handlers (`handlers.nim`) are now implemented as effect handlers
+built on top of the algebra and VM, bridging two audiences: app developers who
+consume ready-made handlers, and handler authors who implement new ones (see
+ADR-007 and ADR-008 for the handler contract and async resume protocol).
+
+Remaining high-level patterns (nursery, channel, sync) will be effect handlers
+built on the same pattern. These are planned but not yet implemented:
 
 | Pattern | Planned Module | Built as | Status |
 |---------|---------------|----------|--------|
+| Standard I/O handlers | `handlers.nim` | Effect handlers | Implemented |
 | Structured concurrency | `nursery.nim` | Effect handler | Planned |
 | Inter-task communication | `channel.nim` | Effect handler | Planned |
 | Synchronization | `sync.nim` | Effect handler | Planned |
@@ -85,11 +92,18 @@ vm/types.nim (depends on core for RtError)
 algebra.nim (depends on core, vm/types for ContId/EffProgram/BoxedValue)
     ^
 vm/engine.nim (depends on core, semantics, vm/types, algebra)
+    ^
+handlers.nim (depends on core, algebra, vm/types, vm/engine)
 ```
 
 #### External Dependencies
 
-None. The library has no external dependencies beyond `nim >= 2.3.0`.
+The core library (`core.nim`, `semantics.nim`, `algebra.nim`, `vm/`) has no
+external dependencies beyond `nim >= 2.3.0`.
+
+`handlers.nim` introduces one conditional dependency: `std/httpclient` is
+imported for the synchronous HTTP handler only. Async variants use the VM's
+own async resume mechanism (see ADR-008) and do not pull in `std/httpclient`.
 
 The `actor-state-machine` dependency was removed after ADR-006 identified it
 as the dominant performance bottleneck (57% of execution time).
@@ -107,14 +121,15 @@ as the dominant performance bottleneck (57% of execution time).
 
 ```
 src/rteffects/
-├── core.nim          # Shared Kernel: RtError, Result[T], TaskId, Unit
-├── semantics.nim     # Evaluation Semantics: TruthValue, Eval[T], lattice ops
-├── algebra.nim       # Effect Algebra: Eff[T], pure, andThen, map, perform, handle
+├── core.nim          # Shared kernel
+├── semantics.nim     # Evaluation Semantics context
+├── algebra.nim       # Effect Algebra context
+├── handlers.nim      # Standard I/O Handlers (HTTP, File, mock, deferred)
 └── vm/
-    ├── types.nim     # VM types: EffOp, EffProgram, ContId, BoxedValue, EffectTag
-    └── engine.nim    # VM engine + runner: Frame, Engine, interpret, run
+    ├── types.nim     # VM Execution context (types)
+    └── engine.nim    # VM Execution context (engine + async resume API)
 
-src/rteffects.nim     # Re-exports (convenience)
+src/rteffects.nim     # Convenience re-export: exports all modules including handlers
 ```
 
 ### Planned Modules (not yet implemented)
@@ -173,7 +188,9 @@ warranted.
 - Each module has a single bounded context with clear ubiquitous language
 - ACL boundaries prevent concept leakage between contexts
 - Modules can be tested independently (semantics.nim has zero side effects)
-- Core module count is small (5 files) making navigation straightforward
+- Core module count is small (6 files including handlers.nim) making navigation straightforward
+- `handlers.nim` proves the pattern: standard I/O handlers live above the VM
+  without modifying core or algebra (see ADR-007, ADR-008)
 - New effect handlers (nursery, channel) will follow the same pattern when added
 
 ### Negative
@@ -186,5 +203,6 @@ warranted.
 ### Neutral
 
 - Total code volume is similar -- just redistributed
-- Planned modules (nursery, channel, sync, trace, cps) will increase file
-  count when implemented but each will follow the established pattern
+- `handlers.nim` is now implemented; remaining planned modules (nursery, channel,
+  sync, trace, cps) will increase file count when implemented but each will
+  follow the established pattern

@@ -8,8 +8,11 @@
 - [ ] Superseded
 
 Core modules (core, semantics, algebra, vm/types, vm/engine) have been
-implemented. Concurrency primitives remain in the v1 runtime and are planned
-for future migration.
+implemented. `handlers.nim` (standard handler library) and the async resume
+API are implemented. Concurrency primitives remain in the v1 runtime and are
+planned for future migration.
+
+**Last updated**: 2026-03-17
 
 ## Summary
 
@@ -110,9 +113,10 @@ src/rteffects/
 ├── core.nim          # RtError, Result[T], TaskId (shared kernel)
 ├── semantics.nim     # TruthValue, Eval[T], Belnap lattice operations
 ├── algebra.nim       # Eff[T], pure, andThen, map, perform, handle
+├── handlers.nim      # Standard handler library (ADR-007) — implemented
 └── vm/
     ├── types.nim     # EffOp, EffProgram, ContId, BoxedValue, EffectTag
-    └── engine.nim    # Frame, Engine, interpret, run (includes runner ACL)
+    └── engine.nim    # Frame, Engine, interpret, run, async resume API (ADR-008)
 ```
 
 **Planned future modules** (not yet implemented):
@@ -176,14 +180,30 @@ with optional debug history (`-d:rteffectsDebug`).
 - **ADR-004**: 3-tier API visibility (app / handler / runner)
 - **ADR-005**: Module boundaries derived from bounded context analysis
 - **ADR-006**: VM performance optimization (StateMachine removal, fast paths)
+- **ADR-007**: Standard handler library (`handlers.nim`) — reusable, composable handlers for common patterns (error, fallback, logging, retry, state)
+- **ADR-008**: Async resume API — `resumeAsync`/`abortAsync` closures returned by the engine enabling handlers to drive resumption from outside the synchronous call stack (async I/O, timers, external callbacks)
+
+## Examples
+
+Examples `ex01`–`ex16` in `examples/` demonstrate the full API surface:
+
+| Range | Focus |
+|-------|-------|
+| ex01–ex08 | Core algebraic effects: pure, andThen, perform/handle, error handling, chained handlers, Belnap B/N states |
+| ex09–ex11 | Belnap 4-valued logic use cases: speculative execution (ex09), policy engine with contradictory rules (ex10), sensor fusion under uncertainty (ex11) |
+| ex12–ex14 | Fault-tolerant pipeline (ex12), validation aggregation with B-state (ex13), knowledge lattice queries (ex14) |
+| ex15 | Standard handlers from `handlers.nim` — retry, fallback, logging, state |
+| ex16 | Async I/O with the async resume API — handler captures `resumeAsync` closure and drives it from an async callback |
 
 ## Migration Path
 
 1. Build new modules alongside existing code (v1 untouched) — **done**
 2. New tests validate v2 modules independently — **done**
-3. Create compatibility layer: `Task[T] = Eff[T]`, `runDefault = run`
-4. Existing test suite validates backward compatibility
-5. Gradually migrate high-level patterns (nursery, channel, sync)
+3. `handlers.nim` standard handler library — **done**
+4. Async resume API (`resumeAsync`/`abortAsync`) — **done**
+5. Create compatibility layer: `Task[T] = Eff[T]`, `runDefault = run`
+6. Existing test suite validates backward compatibility
+7. Gradually migrate high-level patterns (nursery, channel, sync)
 
 ## Rejected Alternatives
 

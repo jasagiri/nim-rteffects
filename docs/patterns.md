@@ -17,6 +17,12 @@ For Belnap semantics (`Eval[T]`, `TruthValue`, `evalTrue`, etc.) also import:
 import rteffects/semantics
 ```
 
+For standard handlers (HTTP, file I/O) use the convenience re-export:
+
+```nim
+import rteffects
+```
+
 ---
 
 ## 1. Effect Handler Patterns
@@ -601,6 +607,114 @@ is appended outside the handler scope, the handler still fires for the `perform`
 because `handle` is placed around the sub-expression containing `perform` in
 the continuation table. However, to keep reasoning straightforward, always
 place `handle` as the outermost combinator.
+
+---
+
+## 6. Standard Handlers Pattern
+
+### Using Pre-built Handlers
+
+The `handlers` module provides typed perform wrappers and matching handler
+implementations for HTTP and file I/O. Use `performHttpGet` instead of manually
+calling `perform` with `boxStr`.
+
+```nim
+import rteffects
+
+# Typed perform wrapper — no manual boxing needed
+let eff = performHttpGet("https://api.example.com/data")
+  .map(proc(resp: string): string {.gcsafe.} = "parsed:" & resp)
+
+# Mock handler for testing — matches by URL substring
+let result = run[string](handle[string](eff, httpGetTag,
+  mockHttpGetHandler(@[("api.example.com", "{\"ok\":true}")]).impl))
+assert result.isOk
+assert result.ok == "parsed:{\"ok\":true}"
+```
+
+### Composing Multiple Standard Handlers
+
+```nim
+import rteffects
+
+let pipeline = performHttpGet("https://api.example.com/config")
+  .andThen(proc(config: string): Eff[string] {.gcsafe.} =
+    performFileWrite("/tmp/config.json", config)
+  )
+
+let handled = handle[string](
+  handle[string](pipeline, httpGetTag,
+    mockHttpGetHandler(@[("api.example.com", "{\"port\":8080}")]).impl),
+  fileWriteTag,
+  syncFileWriteHandler().impl)
+```
+
+---
+
+## 7. Async Resume Pattern
+
+### Deferred Handler + External Resume
+
+Deferred handlers do not call `resume`. The frame suspends and waits for
+an external callback (event loop, async I/O completion) to call
+`engine.resumeFrame` or `engine.abortFrame`.
+
+```nim
+import rteffects
+
+# 1. Build effect with deferred handler
+let eff = handle[string](
+  performHttpGet("https://slow.api/data"), httpGetTag,
+  deferredHttpGetHandler().impl)
+
+# 2. Submit to engine
+let engine = newEngine(budget = 200)
+let fid = engine.newFrame(eff.program, eff.program.entry)
+engine.runLoop()
+
+# Frame is now suspended
+assert engine.hasSuspended()
+assert not engine.allDone()
+
+# 3. Later, when async I/O completes:
+engine.resumeFrame(fid, boxStr("HTTP 200 response body"))
+engine.runLoop()
+
+assert engine.allDone()
+assert engine.frames[fid].result.strVal == "HTTP 200 response body"
+```
+
+### Aborting a Suspended Frame
+
+```nim
+import rteffects
+
+engine.abortFrame(fid, exceptionError("connection timeout"))
+engine.runLoop()
+
+assert engine.frames[fid].failed
+assert engine.frames[fid].error.msg == "connection timeout"
+```
+
+### Multiple Concurrent Suspended Frames
+
+```nim
+import rteffects
+
+let engine = newEngine(budget = 500)
+let fidA = engine.newFrame(effA.program, effA.program.entry)
+let fidB = engine.newFrame(effB.program, effB.program.entry)
+engine.runLoop()
+
+# Both suspended — resume in any order
+engine.resumeFrame(fidB, boxStr("B done"))
+engine.resumeFrame(fidA, boxStr("A done"))
+engine.runLoop()
+
+assert engine.allDone()
+```
+
+---
 
 ### Type Erasure: BoxedValue Must Be Unboxed to the Correct Type
 

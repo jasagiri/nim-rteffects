@@ -5,7 +5,7 @@ evaluation semantics, and a state machine VM.
 
 ## Requirements
 
-- Nim >= 2.3.0
+- Nim >= 2.2.8
 - [actor-state-machine](https://github.com/jasagiri/actor-state-machine) (sibling project)
 - [egison-patterns](https://github.com/jasagiri/egison-patterns) (transitive dependency)
 
@@ -30,6 +30,7 @@ RTEffects v2 replaces v1's CPS callback architecture with:
 Tier 1 (App developer):  Eff[T], pure, andThen, map, perform, handle
 Tier 2 (Handler author): + TruthValue, Eval[T], BoxedValue, resume/abort
 Tier 3 (Runner):         run() → Result[T]  (the only 2-valued boundary)
+Standard handlers:       handlers module (HTTP, File I/O, mock, deferred)
 ```
 
 ## Quick Start
@@ -73,9 +74,10 @@ src/rteffects/
 ├── core.nim          # RtError, Result[T], TaskId (shared kernel)
 ├── semantics.nim     # TruthValue, Eval[T], Belnap lattice operations
 ├── algebra.nim       # Eff[T], pure, andThen, map, perform, handle
+├── handlers.nim      # Standard effect tags (HTTP, File), sync/mock/deferred handlers
 └── vm/
     ├── types.nim     # EffOp, EffProgram, ContId, BoxedValue, EffectTag
-    └── engine.nim    # Frame, Engine, interpret, run (includes runner ACL)
+    └── engine.nim    # Frame, Engine, interpret, run, resumeFrame, abortFrame
 ```
 
 ## Core Types
@@ -92,10 +94,25 @@ src/rteffects/
 - `Eval[T]` — Computation result with 4-valued truth, value, and error.
 - `join`, `meet`, `negate`, `leqI` — Belnap lattice operations.
 
+### Standard Handlers
+
+- `handlers` module — Ready-to-use effect tags and handlers for HTTP and file I/O.
+- `performHttpGet`, `performHttpPost`, `performFileRead`, `performFileWrite` — Typed perform wrappers.
+- `syncHttpGetHandler`, `syncHttpPostHandler`, `syncFileReadHandler`, `syncFileWriteHandler` — Blocking handlers.
+- `mockHttpGetHandler`, `mockFileReadHandler` — URL/path substring matching for tests.
+- `deferredHttpGetHandler`, `deferredHttpPostHandler`, `deferredFileReadHandler` — Suspend frame for async I/O.
+
 ### Runner (Tier 3)
 
 - `run[T](eff): Result[T]` — Interpret and collapse to 2-valued result.
 - `interpret[T](eff): Eval[T]` — Interpret without collapsing.
+
+### Async Resume API (Engine)
+
+- `resumeFrame(engine, frameId, value)` — Resume a suspended frame with a value.
+- `abortFrame(engine, frameId, error)` — Abort a suspended frame with an error.
+- `hasSuspended(engine): bool` — Check if any frames are waiting for async I/O.
+- `allDone(engine): bool` — Check if all frames are complete.
 
 ## Running Tests
 
@@ -106,6 +123,10 @@ nim c -r tests/t_semantics.nim
 nim c -r tests/t_eval.nim
 nim c -r tests/t_vm_types.nim
 nim c -r tests/t_algebra.nim
+nim c -r tests/t_core.nim
+nim c -r tests/t_handlers.nim
+nim c -r tests/t_async_resume.nim
+nim c -r tests/t_engine_properties.nim
 ```
 
 ## Design Documents
