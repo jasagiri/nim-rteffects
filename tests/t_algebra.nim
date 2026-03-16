@@ -55,3 +55,85 @@ suite "Eff[T] Composition":
         hasHandle = true
         check op.handleTag == tag
     check hasHandle
+
+suite "Eff[T] Type-specific boxing":
+  test "given pure(string) then string value roundtrips":
+    let eff = pure[string]("hello")
+    check eff.program.ops[0].kind == opPure
+    check unboxStr(eff.program.ops[0].pureValue) == "hello"
+
+  test "given pure(float) then float value roundtrips":
+    let eff = pure[float](3.14)
+    check eff.program.ops[0].kind == opPure
+    check unboxFloat(eff.program.ops[0].pureValue) == 3.14
+
+  test "given pure(bool) then bool value roundtrips":
+    let eff = pure[bool](true)
+    check eff.program.ops[0].kind == opPure
+    check unboxBool(eff.program.ops[0].pureValue) == true
+
+  test "given map from int to string then type conversion works":
+    let eff = pure[int](42).map(proc(x: int): string {.gcsafe.} = $x)
+    check eff.program.ops[eff.program.entry.int].kind == opMap
+
+  test "given map from int to float then type conversion works":
+    let eff = pure[int](5).map(proc(x: int): float {.gcsafe.} = float(x) * 1.5)
+    check eff.program.ops[eff.program.entry.int].kind == opMap
+
+  test "given map from int to bool then type conversion works":
+    let eff = pure[int](1).map(proc(x: int): bool {.gcsafe.} = x > 0)
+    check eff.program.ops[eff.program.entry.int].kind == opMap
+
+suite "Eff[T] mergeProgram with all op kinds":
+  test "given andThen with perform source then opBind + opPerform merged":
+    let tag = EffectTag("eff")
+    let eff = perform[int](tag, boxInt(1)).andThen(proc(x: int): Eff[int] {.gcsafe.} =
+      pure[int](x + 1)
+    )
+    # The merged program should have opPerform, opMap/opBind
+    var hasPerform = false
+    var hasBind = false
+    for op in eff.program.ops:
+      if op.kind == opPerform: hasPerform = true
+      if op.kind == opBind: hasBind = true
+    check hasPerform
+    check hasBind
+
+  test "given handle with map body then opHandle + opMap merged":
+    let tag = EffectTag("eff")
+    let body = pure[int](1).map(proc(x: int): int {.gcsafe.} = x * 2)
+    let eff = body.handle(tag, proc(p: BoxedValue,
+        r: proc(v: BoxedValue) {.gcsafe.},
+        a: proc(e: RtError) {.gcsafe.}) {.gcsafe.} =
+      r(p)
+    )
+    var hasHandle = false
+    var hasMap = false
+    for op in eff.program.ops:
+      if op.kind == opHandle: hasHandle = true
+      if op.kind == opMap: hasMap = true
+    check hasHandle
+    check hasMap
+
+suite "Eff[T] non-primitive type (else branch)":
+  test "given pure(Unit) then program uses boxNone for non-primitive type":
+    let eff = pure[Unit](unit())
+    check eff.program.ops.len == 1
+    check eff.program.ops[0].kind == opPure
+    # Non-primitive types use boxNone
+    check eff.program.ops[0].pureValue.kind == bvNone
+
+  test "given fail[Unit] then error is preserved":
+    let eff = fail[Unit](foreignError("oops"))
+    check eff.program.ops[0].kind == opFail
+    check eff.program.ops[0].failError.kind == ForeignError
+
+  test "given andThen from Unit to int then type conversion works":
+    let eff = pure[Unit](unit()).andThen(proc(u: Unit): Eff[int] {.gcsafe.} =
+      pure[int](42)
+    )
+    check eff.program.ops[eff.program.entry.int].kind == opBind
+
+  test "given map from Unit to int then type conversion works":
+    let eff = pure[Unit](unit()).map(proc(u: Unit): int {.gcsafe.} = 42)
+    check eff.program.ops[eff.program.entry.int].kind == opMap

@@ -43,6 +43,37 @@ suite "TruthValue Lattice - negate":
     for v in TruthValue:
       check negate(negate(v)) == v
 
+suite "TruthValue Lattice - meet":
+  test "given tvTrue and tvFalse when met then tvNeither":
+    check meet(tvTrue, tvFalse) == tvNeither
+
+  test "given tvTrue and tvNeither when met then tvNeither":
+    check meet(tvTrue, tvNeither) == tvNeither
+
+  test "given tvFalse and tvNeither when met then tvNeither":
+    check meet(tvFalse, tvNeither) == tvNeither
+
+  test "given tvBoth and tvNeither when met then tvNeither":
+    check meet(tvBoth, tvNeither) == tvNeither
+
+  test "given tvTrue and tvTrue when met then tvTrue":
+    check meet(tvTrue, tvTrue) == tvTrue
+
+  test "given tvFalse and tvFalse when met then tvFalse":
+    check meet(tvFalse, tvFalse) == tvFalse
+
+  test "given tvBoth and tvBoth when met then tvBoth":
+    check meet(tvBoth, tvBoth) == tvBoth
+
+  test "given tvNeither and tvNeither when met then tvNeither":
+    check meet(tvNeither, tvNeither) == tvNeither
+
+  test "given tvBoth and tvTrue when met then tvTrue":
+    check meet(tvBoth, tvTrue) == tvTrue
+
+  test "given tvBoth and tvFalse when met then tvFalse":
+    check meet(tvBoth, tvFalse) == tvFalse
+
 suite "TruthValue Lattice - algebraic laws":
   test "given join then it is commutative":
     for a in TruthValue:

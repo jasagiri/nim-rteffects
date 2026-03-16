@@ -64,3 +64,42 @@ suite "BoxedValue":
   test "given string when boxed and unboxed then value preserved":
     let bv = boxStr("hello")
     check unboxStr(bv) == "hello"
+
+  test "given float when boxed and unboxed then value preserved":
+    let bv = boxFloat(3.14)
+    check unboxFloat(bv) == 3.14
+
+  test "given bool when boxed and unboxed then value preserved":
+    let bv = boxBool(true)
+    check unboxBool(bv) == true
+    let bv2 = boxBool(false)
+    check unboxBool(bv2) == false
+
+  test "given ref when boxed then kind is bvRef":
+    let r = new(RootObj)
+    let bv = boxRef(r)
+    check bv.kind == bvRef
+    check bv.refVal == r
+
+  test "given none when boxed then kind is bvNone":
+    let bv = boxNone()
+    check bv.kind == bvNone
+
+suite "ContId display":
+  test "given ContId when converted to string then formatted correctly":
+    check $ContId(0) == "ContId(0)"
+    check $ContId(42) == "ContId(42)"
+
+suite "EffectTag display":
+  test "given EffectTag when converted to string then displays raw string":
+    check $EffectTag("read") == "read"
+    check $EffectTag("write") == "write"
+
+suite "addOp":
+  test "given program when addOp then returns sequential ContIds":
+    var prog = EffProgram()
+    let id0 = prog.addOp(EffOp(kind: opPure, pureValue: boxInt(1)))
+    let id1 = prog.addOp(EffOp(kind: opFail, failError: RtError(kind: Timeout, msg: "t")))
+    check id0 == ContId(0)
+    check id1 == ContId(1)
+    check prog.ops.len == 2

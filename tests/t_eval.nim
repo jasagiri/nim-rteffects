@@ -96,6 +96,47 @@ suite "Eval[T] flatMap":
     check result.truth == tvNeither
     check not called
 
+  test "given evalBoth when flatMapped to evalTrue then truth is tvBoth and outer error preserved":
+    let ev = evalBoth(1, RtError(kind: Cancelled, msg: "c"))
+    let result = ev.flatMap(proc(x: int): Eval[string] =
+      evalTrue($x)  # inner has no error
+    )
+    # join(tvBoth, tvTrue) == tvBoth
+    check result.truth == tvBoth
+    check result.value == some("1")
+    # inner.error.isNone → outer error preserved
+    check result.error.isSome
+    check result.error.get.kind == Cancelled
+
+  test "given evalBoth when flatMapped to evalFalse then truth is tvBoth and inner error used":
+    let ev = evalBoth(1, RtError(kind: Cancelled, msg: "outer"))
+    let result = ev.flatMap(proc(x: int): Eval[string] =
+      evalFalse[string](RtError(kind: Timeout, msg: "inner"))
+    )
+    # join(tvBoth, tvFalse) == tvBoth
+    check result.truth == tvBoth
+    # inner.error.isSome → inner error used
+    check result.error.isSome
+    check result.error.get.kind == Timeout
+
+  test "given evalBoth when flatMapped to evalBoth then truth is tvBoth":
+    let ev = evalBoth(1, RtError(kind: Cancelled, msg: "outer"))
+    let result = ev.flatMap(proc(x: int): Eval[string] =
+      evalBoth($x, RtError(kind: Timeout, msg: "inner"))
+    )
+    check result.truth == tvBoth
+    check result.value == some("1")
+    check result.error.isSome
+    check result.error.get.kind == Timeout
+
+  test "given evalBoth when flatMapped to evalNeither then truth is tvBoth":
+    let ev = evalBoth(1, RtError(kind: Cancelled, msg: "outer"))
+    let result = ev.flatMap(proc(x: int): Eval[string] =
+      evalNeither[string]()
+    )
+    # join(tvBoth, tvNeither) == tvBoth
+    check result.truth == tvBoth
+
 suite "Eval[T] toResult (ACL: 4-value to 2-value)":
   test "given evalTrue(42) when toResult then ok(42)":
     let ev = evalTrue(42)

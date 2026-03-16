@@ -320,7 +320,7 @@ proc tryFastInterpret[T](eff: Eff[T]): (bool, Eval[T]) =
   ## Returns (handled, result). If handled=false, fall back to full Engine.
   let entry = eff.program.entry.int
   if entry < 0 or entry >= eff.program.ops.len:
-    return (false, evalNeither[T]())
+    return (true, evalNeither[T]())
 
   let op = eff.program.ops[entry]
   case op.kind
