@@ -49,15 +49,19 @@ type
     when defined(rteffectsDebug):
       transitions*: seq[TransitionRecord]
 
+  FrameRef* = ref Frame
+    ## Heap-allocated frame. seq[FrameRef] realloc does not invalidate
+    ## frame data addresses — only the pointer array moves, not the frames.
+
   Engine* = ref object
-    frames*: seq[Frame]
+    frames*: seq[FrameRef]
     readyQ*: seq[int]       ## Simple queue (append + index scan)
     readyHead*: int         ## Index of next item to dequeue
     budget*: int
 
 proc `==`*(a, b: FrameId): bool {.borrow.}
 
-proc transition(frame: var Frame, to: FrameState) {.inline.} =
+proc transition(frame: Frame | FrameRef, to: FrameState) {.inline.} =
   when defined(rteffectsDebug):
     frame.transitions.add(TransitionRecord(
       fromState: frame.state, toState: to))
@@ -77,7 +81,7 @@ proc nextId*(engine: Engine): int {.inline.} =
 proc newFrame*(engine: Engine, program: EffProgram, entry: ContId,
                parentFrameId: int = -1): int =
   let id = engine.frames.len
-  engine.frames.add(Frame(
+  let fr = FrameRef(
     id: FrameId(id),
     pc: entry,
     program: program,
@@ -85,10 +89,11 @@ proc newFrame*(engine: Engine, program: EffProgram, entry: ContId,
     hasResult: false,
     failed: false,
     parentFrameId: parentFrameId,
-  ))
+  )
+  engine.frames.add(fr)
   # Inherit handlers from parent frame
   if parentFrameId >= 0 and parentFrameId < engine.frames.len:
-    engine.frames[id].handlers = engine.frames[parentFrameId].handlers
+    fr.handlers = engine.frames[parentFrameId].handlers
   engine.readyQ.add(id)
   id
 
@@ -102,14 +107,14 @@ proc dequeue(engine: Engine): int {.inline.} =
 proc queueLen(engine: Engine): int {.inline.} =
   engine.readyQ.len - engine.readyHead
 
-proc findHandler(frame: Frame, tag: EffectTag): int =
+proc findHandler(frame: Frame | FrameRef, tag: EffectTag): int =
   ## Find handler index for tag (last matching = innermost).
   for i in countdown(frame.handlers.high, 0):
     if frame.handlers[i].tag == tag:
       return i
   return -1
 
-proc completeOrReturn(engine: Engine, frame: var Frame, frameId: int) =
+proc completeOrReturn(engine: Engine, frame: FrameRef, frameId: int) =
   ## After producing a result (or error), return to parent op or mark done.
   if frame.contStack.len > 0:
     frame.pc = frame.contStack.pop()
@@ -146,8 +151,8 @@ proc step(engine: Engine): bool =
   if frameId >= engine.frames.len:
     return true
 
-  # Work directly on frame in place (avoid ~200 byte copy/writeback per step)
-  template frame: untyped = engine.frames[frameId]
+  # FrameRef: heap-allocated, stable address even after seq realloc
+  let frame = engine.frames[frameId]
   frame.transition(fsRunning)
 
   let op = frame.program.ops[frame.pc.int]
