@@ -45,6 +45,7 @@ type
     error*: RtError
     handlers*: seq[HandlerEntry]
     contStack*: seq[ContId]  ## Return address stack
+    parentFrameId*: int      ## -1 = root frame; >= 0 = spawned for bvProgram
     when defined(rteffectsDebug):
       transitions*: seq[TransitionRecord]
 
@@ -73,7 +74,8 @@ proc newEngine*(budget = 1000): Engine =
 proc nextId*(engine: Engine): int {.inline.} =
   engine.frames.len
 
-proc newFrame*(engine: Engine, program: EffProgram, entry: ContId): int =
+proc newFrame*(engine: Engine, program: EffProgram, entry: ContId,
+               parentFrameId: int = -1): int =
   let id = engine.frames.len
   engine.frames.add(Frame(
     id: FrameId(id),
@@ -82,7 +84,11 @@ proc newFrame*(engine: Engine, program: EffProgram, entry: ContId): int =
     state: fsReady,
     hasResult: false,
     failed: false,
+    parentFrameId: parentFrameId,
   ))
+  # Inherit handlers from parent frame
+  if parentFrameId >= 0 and parentFrameId < engine.frames.len:
+    engine.frames[id].handlers = engine.frames[parentFrameId].handlers
   engine.readyQ.add(id)
   id
 
@@ -111,6 +117,22 @@ proc completeOrReturn(engine: Engine, frame: var Frame, frameId: int) =
     engine.enqueue(frameId)
   else:
     frame.transition(fsDone)
+
+proc resolveBvPrograms(engine: Engine) =
+  ## Resolve bvProgram results in done frames by spawning child frames.
+  ## Child inherits parent's handlers. Parent waits in fsSuspended.
+  for i in 0 ..< engine.frames.len:
+    if engine.frames[i].state != fsDone: continue
+    if not engine.frames[i].hasResult: continue
+    if engine.frames[i].result.kind != bvProgram: continue
+    if engine.frames[i].failed: continue
+    let innerProg = engine.frames[i].result.innerProgram
+    # Spawn child — this may grow engine.frames
+    let childId = engine.newFrame(innerProg, innerProg.entry, i)
+    # Modify parent after spawn (safe: no var-ref aliasing)
+    engine.frames[i].hasResult = false
+    engine.frames[i].transition(fsSuspended)
+    return  # Process one at a time to avoid iteration invalidation
 
 # Forward declaration for mutual recursion
 proc interpretStep(engine: Engine, program: EffProgram, entry: ContId): tuple[hasResult: bool, result: BoxedValue, failed: bool, error: RtError]
@@ -145,15 +167,15 @@ proc step(engine: Engine): bool =
     if frame.hasResult:
       # Source completed. Check for bvProgram (from andThen).
       if frame.result.kind == bvProgram:
-        # Fast-resolve trivial inner programs without creating a new frame
+        # Resolve nested program via child frame (inherits handlers)
         let innerProg = frame.result.innerProgram
         let innerEntry = innerProg.entry.int
+        # Fast-resolve trivial inner programs inline (no frame needed)
         if innerEntry >= 0 and innerEntry < innerProg.ops.len:
           let innerOp = innerProg.ops[innerEntry]
           case innerOp.kind
           of opPure:
             frame.result = innerOp.pureValue
-            # Re-visit this opBind with the resolved value
             frame.transition(fsReady)
             engine.enqueue(frameId)
           of opFail:
@@ -162,23 +184,12 @@ proc step(engine: Engine): bool =
             frame.hasResult = false
             completeOrReturn(engine, frame, frameId)
           else:
-            # Complex inner program — full interpretation
-            let inner = engine.interpretStep(innerProg, innerProg.entry)
-            # Note: interpretStep may grow engine.frames, but template
-            # re-evaluates engine.frames[frameId] each access, so this is safe.
-            if inner.failed:
-              frame.error = inner.error
-              frame.failed = true
-              frame.hasResult = false
-              completeOrReturn(engine, frame, frameId)
-            elif inner.hasResult:
-              frame.result = inner.result
-              frame.transition(fsReady)
-              engine.enqueue(frameId)
-            else:
-              frame.transition(fsSuspended)
+            # Complex inner program — mark as done with bvProgram result.
+            # spawnChildForBvProgram (called after step) will spawn child frame.
+            completeOrReturn(engine, frame, frameId)
         else:
-          frame.transition(fsSuspended)
+          frame.hasResult = false
+          completeOrReturn(engine, frame, frameId)
       else:
         # Plain value — move to next phase (tail position, no push)
         frame.pc = op.bindNext
@@ -262,13 +273,53 @@ proc step(engine: Engine): bool =
 
   return true
 
+proc propagateChildResults(engine: Engine) =
+  ## Check for done child frames and propagate results to suspended parents.
+  ## Parent goes directly to fsDone (not re-enqueued for stepping).
+  for i in 0 ..< engine.frames.len:
+    let child = engine.frames[i]
+    if child.state != fsDone: continue
+    if child.parentFrameId < 0: continue
+    let pid = child.parentFrameId
+    if pid >= engine.frames.len: continue
+    if engine.frames[pid].state != fsSuspended: continue
+    # Propagate child result directly to parent as final result
+    if child.failed:
+      engine.frames[pid].error = child.error
+      engine.frames[pid].failed = true
+    elif child.hasResult:
+      engine.frames[pid].result = child.result
+      engine.frames[pid].hasResult = true
+    # Parent is done (not re-enqueued — child resolved its bvProgram)
+    engine.frames[pid].transition(fsDone)
+    # Mark child as consumed
+    engine.frames[i].parentFrameId = -1
+    # Check if parent's result is another bvProgram (chain of andThen)
+    # This will be picked up by resolveBvPrograms in the next iteration
+
+proc hasWorkToDo(engine: Engine): bool =
+  ## Check if there's pending work (queued frames, bvProgram to resolve, or child→parent to propagate).
+  if engine.queueLen > 0: return true
+  for f in engine.frames:
+    if f.state == fsDone and f.hasResult and f.result.kind == bvProgram and not f.failed:
+      return true  # bvProgram needs resolution
+    if f.state == fsDone and f.parentFrameId >= 0:
+      return true  # child result needs propagation
+  false
+
 proc runLoop*(engine: Engine) =
   ## Execute until no more work or budget exhausted.
+  ## Automatically resolves bvProgram chains and propagates child results.
   var steps = 0
-  while engine.queueLen > 0 and steps < engine.budget:
-    if not engine.step():
-      break
-    steps += 1
+  while steps < engine.budget and engine.hasWorkToDo():
+    if engine.queueLen > 0:
+      if not engine.step():
+        discard
+      steps += 1
+    # Resolve bvProgram results via child frames
+    engine.resolveBvPrograms()
+    # Propagate child→parent results
+    engine.propagateChildResults()
 
 proc interpretProgram*(engine: Engine, program: EffProgram, entry: ContId): tuple[hasResult: bool, result: BoxedValue, failed: bool, error: RtError] =
   let frameId = engine.newFrame(program, entry)
@@ -333,21 +384,24 @@ proc tryFastInterpret[T](eff: Eff[T]): (bool, Eval[T]) =
 
 proc interpret*[T](eff: Eff[T], budget = 10000): Eval[T] =
   ## Interpret an Eff[T] and produce an Eval[T].
+  ## Uses Engine with runLoop for automatic bvProgram resolution.
   # Fast path for trivial programs
   let (handled, fastResult) = tryFastInterpret[T](eff)
   if handled:
     return fastResult
 
-  # Full Engine path
+  # Full Engine path with runLoop (resolves bvProgram chains automatically)
   let engine = newEngine(budget)
-  let res = engine.interpretStep(eff.program, eff.program.entry)
+  let frameId = engine.newFrame(eff.program, eff.program.entry)
+  engine.runLoop()
 
-  if res.failed:
-    evalFalse[T](res.error)
-  elif res.hasResult:
-    evalTrue(eff.unboxer(res.result))
-  else:
-    evalNeither[T]()
+  if frameId < engine.frames.len:
+    let frame = engine.frames[frameId]
+    if frame.failed:
+      return evalFalse[T](frame.error)
+    elif frame.hasResult:
+      return evalTrue(eff.unboxer(frame.result))
+  evalNeither[T]()
 
 proc run*[T](eff: Eff[T], budget = 10000): Result[T] {.raises: [].} =
   ## The runner ACL: interpret Eff[T] and collapse to Result[T].

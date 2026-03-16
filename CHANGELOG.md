@@ -7,8 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.1.0] — 2026-03-17
 
-Initial public release. RTEffects v2 is a complete rewrite from the v1 CPS-based
-architecture to algebraic effects with Belnap 4-valued paraconsistent logic.
+RTEffects v2 with algebraic effects, Belnap 4-valued paraconsistent logic,
+and automatic bvProgram chain resolution for andThen composition.
 
 ### Highlights
 
@@ -62,12 +62,15 @@ architecture to algebraic effects with Belnap 4-valued paraconsistent logic.
 
 #### VM Engine (`rteffects/vm/engine`)
 - `Engine` cooperative single-threaded effect interpreter
-- `Frame` execution state with `contStack` return addresses
+- `Frame` execution state with `contStack` return addresses and `parentFrameId`
 - `FrameState`: `fsReady`, `fsRunning`, `fsSuspended`, `fsDone`
-- `interpret[T](eff, budget)` → `Eval[T]` (4-valued result)
+- `interpret[T](eff, budget)` → `Eval[T]` (4-valued result, uses `runLoop`)
 - `run[T](eff, budget)` → `Result[T]` (2-valued collapse)
 - Fast-path optimization: trivial `opPure`/`opFail` bypass Engine overhead entirely
-- Inline `bvProgram` resolution avoids frame creation for simple `andThen` chains
+- **bvProgram auto-resolution**: `andThen` chains resolved via child frame spawning
+  with handler inheritance — `resolveBvPrograms()` + `propagateChildResults()`
+- `newFrame(parentFrameId)`: child frames inherit parent's handlers automatically
+- `hasWorkToDo()`: checks queued + bvProgram pending + child propagation pending
 - `seq[Frame]` + `readyHead` index replace `Table[int, Frame]` (ADR-006)
 - `when defined(rteffectsDebug)`: transition history tracking
 
@@ -107,6 +110,8 @@ architecture to algebraic effects with Belnap 4-valued paraconsistent logic.
   finds consensus
 - ex16: **Knowledge lattice** — monotone fact accumulation, `negate(tvBoth) = tvBoth`
   (contradiction as fixed point)
+- ex17: **Parallel branches** — multi-frame Engine execution, andThen chain with
+  handler inheritance, deferred parallel with external resume
 
 #### Tests
 - `t_core`: 28 tests — error types, constructors, formatting
@@ -123,7 +128,7 @@ architecture to algebraic effects with Belnap 4-valued paraconsistent logic.
   composition
 - `t_async_resume`: 4 tests — suspend, resume, abort, concurrent frames
 
-**Total: 180 tests, 16 runnable examples**
+**Total: 189 tests, 17 runnable examples**
 
 #### Documentation
 - API reference covering all four tiers

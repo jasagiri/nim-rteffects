@@ -113,6 +113,16 @@ src/rteffects/
 - `hasSuspended(engine): bool` — Check if any frames are waiting for async I/O.
 - `allDone(engine): bool` — Check if all frames are complete.
 
+### bvProgram Auto-Resolution
+
+`andThen` chains produce intermediate `bvProgram` results. The Engine
+automatically resolves these via child frame spawning:
+
+- `Frame.parentFrameId` — tracks parent for result propagation
+- `newFrame(parentFrameId)` — child inherits parent's handlers
+- `runLoop()` calls `resolveBvPrograms()` + `propagateChildResults()` each step
+- Nested `andThen` chains resolve to arbitrary depth within budget
+
 ## Running Tests
 
 ```bash
