@@ -5,14 +5,23 @@ nimcache/
 *.so
 *.dylib
 
-# Compiled binaries (examples and tests)
-examples/ex[0-9]*[!.nim]
-tests/t_*[!.nim]
+# Compiled binaries (examples)
+# Match extensionless files: include all, then un-ignore sources
+examples/*
+!examples/*.nim
+!examples/*.nims
+!examples/README*
+
+# Compiled binaries (tests)
+tests/*
+!tests/*.nim
+!tests/*.nims
 
 # Benchmark binaries
-benchmarks/bench
-benchmarks/bench_cost
-benchmarks/bench_opt
+benchmarks/*
+!benchmarks/*.nim
+!benchmarks/*.nims
+!benchmarks/README*
 
 # Compiled VM engine binary
 src/rteffects/vm/engine

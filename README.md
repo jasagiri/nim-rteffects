@@ -6,8 +6,7 @@ evaluation semantics, and a state machine VM.
 ## Requirements
 
 - Nim >= 2.2.8
-- [actor-state-machine](https://github.com/jasagiri/actor-state-machine) (sibling project)
-- [egison-patterns](https://github.com/jasagiri/egison-patterns) (transitive dependency)
+- No external dependencies
 
 ## Architecture
 
