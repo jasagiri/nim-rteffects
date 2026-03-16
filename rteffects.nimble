@@ -4,4 +4,4 @@ description = "CPS-based runtime effects library for Nim"
 license = "Apache-2.0"
 srcDir = "src"
 
-requires "nim >= 2.3.0"
+requires "nim >= 2.2.8"
