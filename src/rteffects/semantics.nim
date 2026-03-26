@@ -22,8 +22,7 @@ type
 # Belnap lattice: information ordering
 #
 #         tvBoth
-#        /      \
-#   tvTrue      tvFalse
+#        /      #   tvTrue      tvFalse
 #        \      /
 #        tvNeither
 
@@ -129,6 +128,39 @@ proc flatMap*[T, U](ev: Eval[T], f: proc(v: T): Eval[U]): Eval[U] =
     )
   of tvNeither:
     evalNeither[U]()
+
+proc join*[T](a, b: Eval[T]): Eval[T] {.raises: [].} =
+  ## Join two evaluations in the information lattice.
+  ## Values and errors are merged. If both have values/errors,
+  ## b's value/error wins unless special logic (like validation) is needed.
+  Eval[T](
+    truth: join(a.truth, b.truth),
+    value: if b.value.isSome: b.value else: a.value,
+    error: if b.error.isSome: b.error else: a.error
+  )
+
+proc joinValidation*[T](a, b: Eval[T]): Eval[T] {.raises: [].} =
+  ## Specialized join for validation that aggregates errors instead of replacing them.
+  let mergedTruth = join(a.truth, b.truth)
+  let mergedValue = if b.value.isSome: b.value else: a.value
+  
+  var errors: seq[RtError] = @[]
+  if a.error.isSome:
+    if a.error.get.kind == AggregateError:
+      errors.add(a.error.get.children)
+    else:
+      errors.add(a.error.get)
+  if b.error.isSome:
+    if b.error.get.kind == AggregateError:
+      errors.add(b.error.get.children)
+    else:
+      errors.add(b.error.get)
+      
+  let mergedError = if errors.len == 0: none(RtError)
+                    elif errors.len == 1: some(errors[0])
+                    else: some(aggregateError(errors))
+                    
+  Eval[T](truth: mergedTruth, value: mergedValue, error: mergedError)
 
 proc toResult*[T](ev: Eval[T]): Result[T] {.raises: [].} =
   ## ACL: collapse 4-valued Eval to 2-valued Result.
