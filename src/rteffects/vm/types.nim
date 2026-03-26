@@ -16,7 +16,7 @@ type
   # --- Boxing for type-erased values ---
 
   BoxedValueKind* = enum
-    bvNone, bvInt, bvStr, bvFloat, bvBool, bvRef, bvProgram
+    bvNone, bvInt, bvStr, bvFloat, bvBool, bvRef, bvProgram, bvValidationIssue
 
   BoxedValue* = object
     ## Type-erased value for the continuation table.
@@ -27,6 +27,7 @@ type
     of bvFloat: floatVal*: float
     of bvBool: boolVal*: bool
     of bvRef: refVal*: RootRef
+    of bvValidationIssue: issueVal*: ValidationIssueDetail
     of bvProgram:
       innerProgram*: EffProgram  ## Nested program from andThen
       innerUnboxer*: proc(v: BoxedValue): BoxedValue {.gcsafe.}
@@ -68,6 +69,9 @@ type
     ops*: seq[EffOp]
     entry*: ContId
 
+const
+  ValidationTag* = EffectTag("Validation")
+
 # --- ContId operations ---
 
 proc `==`*(a, b: ContId): bool {.borrow.}
@@ -98,6 +102,9 @@ proc boxBool*(v: bool): BoxedValue {.raises: [].} =
 proc boxRef*(v: RootRef): BoxedValue {.raises: [].} =
   BoxedValue(kind: bvRef, refVal: v)
 
+proc boxIssue*(v: ValidationIssueDetail): BoxedValue {.raises: [].} =
+  BoxedValue(kind: bvValidationIssue, issueVal: v)
+
 proc boxNone*(): BoxedValue {.raises: [].} =
   BoxedValue(kind: bvNone)
 
@@ -112,6 +119,9 @@ proc unboxFloat*(v: BoxedValue): float {.raises: [].} =
 
 proc unboxBool*(v: BoxedValue): bool {.raises: [].} =
   v.boolVal
+
+proc unboxIssue*(v: BoxedValue): ValidationIssueDetail {.raises: [].} =
+  v.issueVal
 
 # --- EffProgram builder helpers ---
 
