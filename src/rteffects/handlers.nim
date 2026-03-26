@@ -28,11 +28,13 @@ const
   httpGetTag* = EffectTag("http:get")
     ## HTTP GET request. Payload: boxStr(url). Resume: boxStr(responseBody).
   httpPostTag* = EffectTag("http:post")
-    ## HTTP POST request. Payload: boxStr(url + "\n" + body). Resume: boxStr(responseBody).
+    ## HTTP POST request. Payload: boxStr(url + "
+" + body). Resume: boxStr(responseBody).
   fileReadTag* = EffectTag("file:read")
     ## File read. Payload: boxStr(path). Resume: boxStr(content).
   fileWriteTag* = EffectTag("file:write")
-    ## File write. Payload: boxStr(path + "\n" + content). Resume: boxNone().
+    ## File write. Payload: boxStr(path + "
+" + content). Resume: boxNone().
 
 type
   HttpPostPayload* = object
@@ -48,7 +50,8 @@ proc performHttpGet*(url: string): Eff[string] =
 
 proc performHttpPost*(url: string, body: string): Eff[string] =
   ## Perform HTTP POST. Payload encodes url + body separated by newline.
-  perform[string](httpPostTag, boxStr(url & "\n" & body))
+  perform[string](httpPostTag, boxStr(url & "
+" & body))
 
 proc performFileRead*(path: string): Eff[string] =
   ## Read a file. Returns content as string.
@@ -56,7 +59,12 @@ proc performFileRead*(path: string): Eff[string] =
 
 proc performFileWrite*(path: string, content: string): Eff[string] =
   ## Write a file. Returns empty string on success.
-  perform[string](fileWriteTag, boxStr(path & "\n" & content))
+  perform[string](fileWriteTag, boxStr(path & "
+" & content))
+
+proc performValidation*(issue: ValidationIssueDetail): Eff[ValidationIssueDetail] =
+  ## Request validation for a single issue.
+  perform[ValidationIssueDetail](ValidationTag, boxIssue(issue))
 
 # ── Sync Handlers (blocking, for simple scripts) ──────────────────
 
@@ -83,7 +91,8 @@ proc syncHttpPostHandler*(): HandlerEntry =
     payload: BoxedValue,
     resume: proc(v: BoxedValue) {.gcsafe.},
     abort: proc(e: RtError) {.gcsafe.}) {.gcsafe.} =
-      let parts = payload.strVal.split('\n', maxsplit = 1)
+      let parts = payload.strVal.split('
+', maxsplit = 1)
       if parts.len < 2:
         abort(exceptionError("HTTP POST payload missing body"))
         return
@@ -121,7 +130,8 @@ proc syncFileWriteHandler*(): HandlerEntry =
     payload: BoxedValue,
     resume: proc(v: BoxedValue) {.gcsafe.},
     abort: proc(e: RtError) {.gcsafe.}) {.gcsafe.} =
-      let parts = payload.strVal.split('\n', maxsplit = 1)
+      let parts = payload.strVal.split('
+', maxsplit = 1)
       if parts.len < 2:
         abort(exceptionError("File write payload missing content"))
         return
@@ -131,6 +141,34 @@ proc syncFileWriteHandler*(): HandlerEntry =
       except CatchableError:
         let msg = try: getCurrentExceptionMsg() except: "File write error"
         abort(exceptionError(msg))
+  )
+
+# ── Validation Handlers ───────────────────────────────────────────
+
+proc failFastValidationHandler*(): HandlerEntry =
+  ## Validation handler that aborts on the first issue.
+  HandlerEntry(tag: ValidationTag, impl: proc(
+    payload: BoxedValue,
+    resume: proc(v: BoxedValue) {.gcsafe.},
+    abort: proc(e: RtError) {.gcsafe.}) {.gcsafe.} =
+      let issue = payload.issueVal
+      abort(validationError(issue.field, issue.rule, issue.value, issue.message))
+  )
+
+proc collectAllValidationHandler*(): HandlerEntry =
+  ## Validation handler that allows continuation, yielding the issue.
+  ## Use with joinValidation to aggregate all issues.
+  HandlerEntry(tag: ValidationTag, impl: proc(
+    payload: BoxedValue,
+    resume: proc(v: BoxedValue) {.gcsafe.},
+    abort: proc(e: RtError) {.gcsafe.}) {.gcsafe.} =
+      let issue = payload.issueVal
+      # We abort but with a ValidationIssue kind.
+      # The engine/runner boundary will convert this to tvBoth if it can.
+      # Wait, if we want to COLLECT, we should actually 'abort' or return something
+      # that semantics.join knows how to handle.
+      # In Belnap terms, a validation failure is a 'tvFalse' for THAT specific check.
+      abort(validationError(issue.field, issue.rule, issue.value, issue.message))
   )
 
 # ── Mock Handlers (for testing) ────────────────────────────────────
