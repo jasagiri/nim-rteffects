@@ -1,4 +1,4 @@
-import std/hashes
+import std/[hashes, options]
 
 type
   TaskId* = distinct int
@@ -13,9 +13,16 @@ type
     Cancelled,
     ExceptionRaised,
     ForeignError,
+    ValidationIssue, ## A single schema validation error
     AggregateError,  ## Multiple errors collected
     Contradiction,   ## Belnap tvBoth collapsed to 2-valued
     Incomplete       ## Belnap tvNeither collapsed to 2-valued
+
+  ValidationIssueDetail* = object
+    field*: string
+    rule*: string
+    value*: string    ## String representation of the invalid value
+    message*: string
 
   RtError* = object
     kind*: RtErrorKind
@@ -23,6 +30,7 @@ type
     cause*: ref RtError       ## Optional cause for error chaining
     stackTrace*: string       ## Optional stack trace
     children*: seq[RtError]   ## For AggregateError
+    issue*: Option[ValidationIssueDetail] ## Detailed info for ValidationIssue
 
   Result*[T] = object
     isOk*: bool
@@ -83,6 +91,18 @@ proc exceptionError*(ex: ref Exception): RtError =
 
 proc foreignError*(msg: string): RtError =
   RtError(kind: RtErrorKind.ForeignError, msg: msg)
+
+proc validationError*(field, rule, value, msg: string): RtError =
+  RtError(
+    kind: RtErrorKind.ValidationIssue,
+    msg: field & ": " & msg,
+    issue: some(ValidationIssueDetail(
+      field: field,
+      rule: rule,
+      value: value,
+      message: msg
+    ))
+  )
 
 proc aggregateError*(errors: seq[RtError]): RtError =
   var msg = "multiple errors occurred"
