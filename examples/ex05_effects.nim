@@ -41,4 +41,27 @@ let result3 = run[int](eff3)
 assert not result3.isOk
 echo "unhandled: ", result3.err.msg  # "unhandled effect: missing"
 
+# --- 4. User-defined ref objects (New in v2.1.0) ---
+type
+  User* = ref object of RootObj
+    id*: int
+    name*: string
+
+let userTag = EffectTag("getUser")
+
+let body4 = perform[User](userTag, boxInt(1))
+let eff4 = body4.handle(userTag, proc(payload: BoxedValue,
+    resume: proc(v: BoxedValue) {.gcsafe.},
+    abort: proc(e: RtError) {.gcsafe.}) {.gcsafe.} =
+  let uid = unboxInt(payload)
+  if uid == 1:
+    resume(boxRef(User(id: 1, name: "Alice")))
+  else:
+    abort(RtError(kind: ForeignError, msg: "user not found"))
+)
+
+let result4 = run[User](eff4)
+assert result4.isOk
+echo "user(1) = ", result4.ok.name  # "Alice"
+
 echo "\nAll ex05 checks passed."

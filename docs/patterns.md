@@ -57,6 +57,37 @@ assert result.isOk
 assert result.ok == 42
 ```
 
+### Handlers with Structured Payloads (ref object)
+
+As of v2.1.0, you can pass user-defined `ref object` types through the effect
+system. This is the preferred way to handle effects with multiple arguments.
+
+```nim
+type
+  AuthRequest* = ref object of RootObj
+    user*: string
+    token*: string
+
+let authTag = EffectTag("auth")
+
+let body = perform[bool](authTag, boxRef(AuthRequest(user: "alice", token: "secret")))
+
+let eff = body.handle(authTag,
+  proc(payload: BoxedValue,
+       resume: proc(v: BoxedValue) {.gcsafe.},
+       abort: proc(e: RtError) {.gcsafe.}) {.gcsafe.} =
+    # Use unboxRef and cast to recover the type.
+    # The system performs an internal 'of' check to ensure safety.
+    let req = cast[AuthRequest](unboxRef(payload))
+    if req.token == "secret":
+      resume(boxBool(true))
+    else:
+      resume(boxBool(false))
+)
+
+assert run[bool](eff).ok == true
+```
+
 ### Aborting Handler (validate input, abort on error)
 
 A handler can call `abort` instead of `resume` to terminate the computation

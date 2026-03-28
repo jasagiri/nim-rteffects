@@ -33,6 +33,10 @@ const
     ## File read. Payload: boxStr(path). Resume: boxStr(content).
   fileWriteTag* = EffectTag("file:write")
     ## File write. Payload: boxStr(path + "\n" + content). Resume: boxNone().
+  ttsSynthesizeTag* = EffectTag("tts:synthesize")
+    ## TTS synthesis. Payload: boxRef(TtsSynthesizePayload). Resume: boxRef(TtsSynthesizeResult).
+  asrTranscribeTag* = EffectTag("asr:transcribe")
+    ## ASR transcription. Payload: boxRef(AsrTranscribePayload). Resume: boxRef(AsrTranscribeResult).
 
 type
   HttpPostPayload* = ref object of RootObj
@@ -43,6 +47,27 @@ type
   FileWritePayload* = ref object of RootObj
     path*: string
     content*: string
+
+  TtsSynthesizePayload* = ref object of RootObj
+    text*: string
+    voice*: string
+    speed*: float32
+    referenceEmbedding*: seq[float32]
+
+  TtsSynthesizeResult* = ref object of RootObj
+    audioData*: seq[byte]
+    format*: string
+    duration*: float32
+    sampleRate*: int32
+
+  AsrTranscribePayload* = ref object of RootObj
+    audioData*: seq[byte]
+    language*: string
+
+  AsrTranscribeResult* = ref object of RootObj
+    text*: string
+    language*: string
+    duration*: float32
 
 # ── Typed Perform Wrappers ─────────────────────────────────────────
 
@@ -67,6 +92,19 @@ proc performFileWrite*(path: string, content: string): Eff[string] =
 proc performValidation*(issue: ValidationIssueDetail): Eff[ValidationIssueDetail] =
   ## Request validation for a single issue.
   perform[ValidationIssueDetail](ValidationTag, boxIssue(issue))
+
+proc performTtsSynthesize*(text: string, voice: string = "default",
+                            speed: float32 = 1.0,
+                            embedding: seq[float32] = @[]): Eff[TtsSynthesizeResult] =
+  ## Request TTS synthesis. Returns audio data.
+  perform[TtsSynthesizeResult](ttsSynthesizeTag, boxRef(TtsSynthesizePayload(
+    text: text, voice: voice, speed: speed, referenceEmbedding: embedding)))
+
+proc performAsrTranscribe*(audioData: seq[byte],
+                            language: string = ""): Eff[AsrTranscribeResult] =
+  ## Request ASR transcription. Returns text.
+  perform[AsrTranscribeResult](asrTranscribeTag, boxRef(AsrTranscribePayload(
+    audioData: audioData, language: language)))
 
 # ── Sync Handlers (blocking, for simple scripts) ──────────────────
 
@@ -234,4 +272,53 @@ proc deferredFileReadHandler*(): HandlerEntry =
     resume: proc(v: BoxedValue) {.gcsafe.},
     abort: proc(e: RtError) {.gcsafe.}) {.gcsafe.} =
       discard
+  )
+
+proc deferredTtsSynthesizeHandler*(): HandlerEntry =
+  ## Deferred TTS handler. Frame goes to fsSuspended.
+  ## Caller resumes via engine.resumeFrame(fid, boxRef(TtsSynthesizeResult(...))).
+  HandlerEntry(tag: ttsSynthesizeTag, impl: proc(
+    payload: BoxedValue,
+    resume: proc(v: BoxedValue) {.gcsafe.},
+    abort: proc(e: RtError) {.gcsafe.}) {.gcsafe.} =
+      discard
+  )
+
+proc deferredAsrTranscribeHandler*(): HandlerEntry =
+  ## Deferred ASR handler. Frame goes to fsSuspended.
+  HandlerEntry(tag: asrTranscribeTag, impl: proc(
+    payload: BoxedValue,
+    resume: proc(v: BoxedValue) {.gcsafe.},
+    abort: proc(e: RtError) {.gcsafe.}) {.gcsafe.} =
+      discard
+  )
+
+proc mockTtsSynthesizeHandler*(audio: seq[byte] = @[],
+                                duration: float32 = 1.0): HandlerEntry =
+  ## Mock TTS: immediately resumes with fixed audio.
+  let capturedAudio = audio
+  let capturedDur = duration
+  HandlerEntry(tag: ttsSynthesizeTag, impl: proc(
+    payload: BoxedValue,
+    resume: proc(v: BoxedValue) {.gcsafe.},
+    abort: proc(e: RtError) {.gcsafe.}) {.gcsafe.} =
+      {.cast(gcsafe).}:
+        resume(boxRef(TtsSynthesizeResult(
+          audioData: capturedAudio, format: "pcm",
+          duration: capturedDur, sampleRate: 24000)))
+  )
+
+proc mockAsrTranscribeHandler*(text: string = "hello",
+                                language: string = "en"): HandlerEntry =
+  ## Mock ASR: immediately resumes with fixed text.
+  let capturedText = text
+  let capturedLang = language
+  HandlerEntry(tag: asrTranscribeTag, impl: proc(
+    payload: BoxedValue,
+    resume: proc(v: BoxedValue) {.gcsafe.},
+    abort: proc(e: RtError) {.gcsafe.}) {.gcsafe.} =
+      {.cast(gcsafe).}:
+        resume(boxRef(AsrTranscribeResult(
+          text: capturedText, language: capturedLang,
+          duration: 1.0)))
   )

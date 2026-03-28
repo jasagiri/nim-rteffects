@@ -5,21 +5,7 @@ RTEffects v2 is an algebraic effects system for Nim with Belnap 4-valued logic. 
 ## Requirements
 
 - Nim >= 2.2.8
-- `actor-state-machine` (sibling package, for VM state management)
-
-## Installation
-
-Add to your `.nimble` file:
-
-```nim
-requires "rteffects"
-```
-
-Or install directly:
-
-```bash
-nimble install rteffects
-```
+- No external dependencies
 
 ## API Tiers
 
@@ -28,9 +14,9 @@ The library is organised into three tiers:
 | Tier | Who uses it | Imports |
 |------|-------------|---------|
 | **Tier 1** — App developer | `Eff[T]`, `pure`, `fail`, `andThen`, `map`, `run` | `rteffects/algebra`, `rteffects/vm/engine` |
-| **Tier 2** — Handler author | `perform`, `handle`, `EffectTag`, `BoxedValue`, `HandlerProc` | `rteffects/algebra`, `rteffects/vm/types` |
+| **Tier 2** — Handler author | `perform`, `handle`, `EffectTag`, `BoxedValue`, `box*`, `unbox*` | `rteffects/algebra`, `rteffects/vm/types` |
 | **Tier 3** — Semantics | `TruthValue`, `Eval[T]`, `interpret` | `rteffects/semantics`, `rteffects/vm/engine` |
-| **Standard handlers** | `performHttpGet`, `mockHttpGetHandler`, `deferredHttpGetHandler`, ... | `rteffects/handlers` (or `rteffects`) |
+| **Standard handlers** | `performHttpGet`, `HttpPostPayload`, `syncHttpGetHandler`, ... | `rteffects/handlers` (or `rteffects`) |
 
 Most application code only needs Tier 1. For HTTP/file I/O effects, `import rteffects` gives access to all tiers including the standard handlers.
 
@@ -171,12 +157,12 @@ echo r.isOk        # false
 echo r.err.msg     # division by zero
 ```
 
-The `budget` parameter of `run` sets a step limit. Exceeding it yields an `Incomplete` error:
+The `budget` parameter of `run` sets a step limit. Exceeding it yields a `Timeout` error:
 
 ```nim
 let r = run(myEff, budget = 500)
-if not r.isOk and r.err.kind == Incomplete:
-  echo "computation ran out of steps"
+if not r.isOk and r.err.kind == Timeout:
+  echo "computation ran out of steps (budget exhausted)"
 ```
 
 ## Algebraic Effects
@@ -185,7 +171,7 @@ Algebraic effects let a computation declare that it needs something from the out
 
 ### EffectTag and BoxedValue
 
-`EffectTag` is a distinct string that names an effect. `BoxedValue` is a type-erased container used to pass data into and out of effect operations.
+`EffectTag` is a distinct string that names an effect. `BoxedValue` is a type-erased container used to pass data into and out of effect operations. As of v2.1.0, it supports primitive types and user-defined `ref object` types.
 
 ```nim
 import rteffects/vm/types
@@ -193,6 +179,12 @@ import rteffects/vm/types
 let tag = EffectTag("double")
 let bv = boxInt(42)
 echo unboxInt(bv)    # 42
+
+# Supporting ref objects
+type User = ref object of RootObj
+  name: string
+let userBv = boxRef(User(name: "Bob"))
+let user = cast[User](unboxRef(userBv))
 ```
 
 ### perform and handle
