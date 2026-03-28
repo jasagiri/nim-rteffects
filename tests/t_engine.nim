@@ -1,4 +1,4 @@
-import std/[unittest, options, tables]
+import std/[unittest, options]
 import rteffects/core
 import rteffects/semantics
 import rteffects/vm/types
@@ -155,7 +155,7 @@ suite "Engine - nextId":
     check engine.nextId == 2
 
 suite "Engine - budget exhaustion":
-  test "given interpret with budget=1 on complex program then evalNeither":
+  test "given interpret with budget=1 on complex program then evalFalse(Timeout)":
     # Create a deep andThen chain that needs many steps
     var eff = pure[int](0)
     for i in 1..10:
@@ -165,7 +165,9 @@ suite "Engine - budget exhaustion":
       )
     # Budget of 1 won't be enough to complete
     let ev = interpret[int](eff, budget = 1)
-    check ev.truth == tvNeither
+    check ev.truth == tvFalse
+    check ev.error.isSome
+    check ev.error.get.kind == Timeout
 
 suite "Engine - run exception handling":
   test "given run when internal exception then catches and returns ExceptionRaised":

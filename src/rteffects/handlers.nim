@@ -28,19 +28,21 @@ const
   httpGetTag* = EffectTag("http:get")
     ## HTTP GET request. Payload: boxStr(url). Resume: boxStr(responseBody).
   httpPostTag* = EffectTag("http:post")
-    ## HTTP POST request. Payload: boxStr(url + "
-" + body). Resume: boxStr(responseBody).
+    ## HTTP POST request. Payload: boxStr(url + "\n" + body). Resume: boxStr(responseBody).
   fileReadTag* = EffectTag("file:read")
     ## File read. Payload: boxStr(path). Resume: boxStr(content).
   fileWriteTag* = EffectTag("file:write")
-    ## File write. Payload: boxStr(path + "
-" + content). Resume: boxNone().
+    ## File write. Payload: boxStr(path + "\n" + content). Resume: boxNone().
 
 type
-  HttpPostPayload* = object
+  HttpPostPayload* = ref object of RootObj
     url*: string
     body*: string
     contentType*: string
+
+  FileWritePayload* = ref object of RootObj
+    path*: string
+    content*: string
 
 # ── Typed Perform Wrappers ─────────────────────────────────────────
 
@@ -48,10 +50,10 @@ proc performHttpGet*(url: string): Eff[string] =
   ## Perform HTTP GET. Returns response body as string.
   perform[string](httpGetTag, boxStr(url))
 
-proc performHttpPost*(url: string, body: string): Eff[string] =
-  ## Perform HTTP POST. Payload encodes url + body separated by newline.
-  perform[string](httpPostTag, boxStr(url & "
-" & body))
+proc performHttpPost*(url: string, body: string, contentType: string = "application/json"): Eff[string] =
+  ## Perform HTTP POST.
+  perform[string](httpPostTag, boxRef(HttpPostPayload(
+    url: url, body: body, contentType: contentType)))
 
 proc performFileRead*(path: string): Eff[string] =
   ## Read a file. Returns content as string.
@@ -59,8 +61,8 @@ proc performFileRead*(path: string): Eff[string] =
 
 proc performFileWrite*(path: string, content: string): Eff[string] =
   ## Write a file. Returns empty string on success.
-  perform[string](fileWriteTag, boxStr(path & "
-" & content))
+  perform[string](fileWriteTag, boxRef(FileWritePayload(
+    path: path, content: content)))
 
 proc performValidation*(issue: ValidationIssueDetail): Eff[ValidationIssueDetail] =
   ## Request validation for a single issue.
@@ -91,18 +93,16 @@ proc syncHttpPostHandler*(): HandlerEntry =
     payload: BoxedValue,
     resume: proc(v: BoxedValue) {.gcsafe.},
     abort: proc(e: RtError) {.gcsafe.}) {.gcsafe.} =
-      let parts = payload.strVal.split('
-', maxsplit = 1)
-      if parts.len < 2:
-        abort(exceptionError("HTTP POST payload missing body"))
+      if payload.kind != bvRef or payload.refVal.isNil or not (payload.refVal of HttpPostPayload):
+        abort(exceptionError("HTTP POST payload missing or invalid type"))
         return
-      let url = parts[0]
-      let body = parts[1]
+      
+      let data = cast[HttpPostPayload](payload.refVal)
       try:
         let client = newHttpClient(timeout = 30000)
         defer: client.close()
-        client.headers = newHttpHeaders({"Content-Type": "application/json"})
-        let resp = client.postContent(url, body)
+        client.headers = newHttpHeaders({"Content-Type": data.contentType})
+        let resp = client.postContent(data.url, data.body)
         resume(boxStr(resp))
       except CatchableError:
         let msg = try: getCurrentExceptionMsg() except: "HTTP POST error"
@@ -130,13 +130,13 @@ proc syncFileWriteHandler*(): HandlerEntry =
     payload: BoxedValue,
     resume: proc(v: BoxedValue) {.gcsafe.},
     abort: proc(e: RtError) {.gcsafe.}) {.gcsafe.} =
-      let parts = payload.strVal.split('
-', maxsplit = 1)
-      if parts.len < 2:
-        abort(exceptionError("File write payload missing content"))
+      if payload.kind != bvRef or payload.refVal.isNil or not (payload.refVal of FileWritePayload):
+        abort(exceptionError("File write payload missing or invalid type"))
         return
+        
+      let data = cast[FileWritePayload](payload.refVal)
       try:
-        writeFile(parts[0], parts[1])
+        writeFile(data.path, data.content)
         resume(boxStr(""))
       except CatchableError:
         let msg = try: getCurrentExceptionMsg() except: "File write error"

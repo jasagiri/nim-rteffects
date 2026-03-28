@@ -22,7 +22,8 @@ type
 # Belnap lattice: information ordering
 #
 #         tvBoth
-#        /      #   tvTrue      tvFalse
+#        /      \
+#   tvTrue      tvFalse
 #        \      /
 #        tvNeither
 
@@ -97,6 +98,32 @@ proc evalBoth*[T](v: T, e: RtError): Eval[T] {.raises: [].} =
 proc evalNeither*[T](): Eval[T] {.raises: [].} =
   Eval[T](truth: tvNeither, value: none(T), error: none(RtError))
 
+proc join*[T](a, b: Eval[T]): Eval[T] {.raises: [].} =
+  ## Join two evaluations in the information lattice.
+  ## Values and errors are merged (least upper bound).
+  Eval[T](
+    truth: join(a.truth, b.truth),
+    value: if b.value.isSome: b.value else: a.value,
+    error: if b.error.isSome: b.error else: a.error
+  )
+
+proc meet*[T](a, b: Eval[T]): Eval[T] {.raises: [].} =
+  ## Meet two evaluations in the information lattice.
+  ## Values and errors are intersected (greatest lower bound).
+  Eval[T](
+    truth: meet(a.truth, b.truth),
+    value: if b.value.isSome: b.value else: a.value,
+    error: if b.error.isSome: b.error else: a.error
+  )
+
+proc negate*[T](ev: Eval[T]): Eval[T] {.raises: [].} =
+  ## Negate an evaluation (Belnap truth negation).
+  Eval[T](
+    truth: negate(ev.truth),
+    value: ev.value,
+    error: ev.error
+  )
+
 proc map*[T, U](ev: Eval[T], f: proc(v: T): U): Eval[U] =
   ## Transform the value if present (tvTrue or tvBoth).
   ## Error and truth are preserved.
@@ -128,16 +155,6 @@ proc flatMap*[T, U](ev: Eval[T], f: proc(v: T): Eval[U]): Eval[U] =
     )
   of tvNeither:
     evalNeither[U]()
-
-proc join*[T](a, b: Eval[T]): Eval[T] {.raises: [].} =
-  ## Join two evaluations in the information lattice.
-  ## Values and errors are merged. If both have values/errors,
-  ## b's value/error wins unless special logic (like validation) is needed.
-  Eval[T](
-    truth: join(a.truth, b.truth),
-    value: if b.value.isSome: b.value else: a.value,
-    error: if b.error.isSome: b.error else: a.error
-  )
 
 proc joinValidation*[T](a, b: Eval[T]): Eval[T] {.raises: [].} =
   ## Specialized join for validation that aggregates errors instead of replacing them.

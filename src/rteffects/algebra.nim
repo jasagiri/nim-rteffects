@@ -35,6 +35,10 @@ proc defaultBoxer[T](v: T): BoxedValue =
     boxFloat(v)
   elif T is bool:
     boxBool(v)
+  elif T is ref:
+    boxRef(v)
+  elif T is ValidationIssueDetail:
+    boxIssue(v)
   else:
     boxNone()
 
@@ -47,6 +51,24 @@ proc defaultUnboxer[T](v: BoxedValue): T =
     unboxFloat(v)
   elif T is bool:
     unboxBool(v)
+  elif T is ref:
+    if v.kind == bvRef and not v.refVal.isNil:
+      if v.refVal of T:
+        cast[T](v.refVal)
+      else:
+        # Internal type mismatch — fail fast instead of returning nil
+        raise newException(Defect, "Internal unboxing error: ref type mismatch")
+    elif v.kind == bvNone:
+      # Explicitly allow nil for bvNone if T is a ref type
+      nil
+    else:
+      # Other kinds (int, string etc.) should not be unboxed as ref
+      raise newException(Defect, "Internal unboxing error: non-ref kind for ref type")
+  elif T is ValidationIssueDetail:
+    if v.kind == bvValidationIssue:
+      v.issueVal
+    else:
+      default(T)
   else:
     default(T)
 
@@ -123,7 +145,7 @@ proc andThen*[T, U](eff: Eff[T], f: proc(v: T): Eff[U] {.gcsafe.}): Eff[U] =
 
   # Add a map-like node that invokes f and returns a bvProgram
   let nextId = result.program.addOp(EffOp(kind: opMap,
-    mapTarget: sourceEntry,
+    mapTarget: ContId(-1), # Result is provided by opBind, no target evaluation needed
     mapFn: proc(v: BoxedValue): BoxedValue {.gcsafe.} =
       # At interpretation time, f(unbox(v)) produces an Eff[U]
       let innerEff = capturedF(capturedUnboxer(v))

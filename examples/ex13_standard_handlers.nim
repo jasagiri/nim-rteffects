@@ -141,7 +141,10 @@ block httpPost:
     impl: proc(payload: BoxedValue,
                resume: proc(v: BoxedValue) {.gcsafe.},
                abort:  proc(e: RtError)  {.gcsafe.}) {.gcsafe.} =
-      # Payload encodes "url\nbody"; echo back a canned response.
+      # Payload is an HttpPostPayload ref object.
+      let data = cast[HttpPostPayload](payload.refVal)
+      assert data.url == "https://api.example.com/submit"
+      assert data.body == """{"name":"Alice"}"""
       resume(boxStr("""{"status":"created"}""")))
 
   let result = run[string](handle[string](eff, httpPostTag, mock.impl))

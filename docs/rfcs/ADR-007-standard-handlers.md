@@ -60,9 +60,11 @@ Wrappers handle boxing via `BoxedValue` so callers never touch the raw
 `perform` API for these operations.
 
 Multi-argument operations (POST, file-write) encode their payload as
-`url & "\n" & body` — a newline-separated string. Handlers split on the first
-newline to recover the arguments. This keeps `perform`'s single-value contract
-without introducing a new tuple boxing layer.
+a `ref object` (e.g., `HttpPostPayload`, `FileWritePayload`) boxed via `boxRef`.
+Handlers cast the `refVal` back to the expected type to recover the arguments.
+This keeps `perform`'s single-value contract while providing type-safe,
+unconstrained payload support.
+
 
 ### HandlerEntry Type
 
@@ -190,15 +192,12 @@ pack multiple strings into one value. Options considered:
 
 | Encoding | Pros | Cons |
 |----------|------|------|
-| Newline separator | Simple, no new type | Fails if content contains newlines |
+| `ref object` | Type-safe, no content limits | Minor allocation cost |
 | JSON object | Handles all content | Adds json parse overhead |
 | Separate effect tags per argument count | Clean types | Combinatorial tag explosion |
 
-Newline separation is sufficient for URLs and file paths (which cannot legally
-contain newlines) and for typical test payloads. POST bodies that contain
-newlines are not supported by the sync/mock variants. Deferred handlers pass
-the raw payload to external I/O infrastructure, which can use a different
-encoding convention.
+`ref object` boxing provides the best balance of type safety, performance,
+and lack of content constraints.
 
 ## Consequences
 
@@ -221,8 +220,6 @@ encoding convention.
   `handlers` (even if they only use mock or deferred variants). Mitigated:
   sync handler procs are only compiled when called; the import is conditional
   on `when not defined(rteffectsNoSync)` if the dependency proves problematic.
-- Newline payload encoding limits POST body and file content to newline-free
-  strings in sync/mock variants.
 - `mockFileWriteHandler` silently discards writes — callers that need to
   inspect written content must author a custom handler.
 

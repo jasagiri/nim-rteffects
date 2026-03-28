@@ -1,6 +1,6 @@
 ## Tests for standard I/O handlers.
 
-import std/[unittest, strutils]
+import std/unittest
 import rteffects
 
 suite "Handlers — typed perform wrappers":
@@ -27,9 +27,10 @@ suite "Handlers — typed perform wrappers":
       proc(payload: BoxedValue,
            resume: proc(v: BoxedValue) {.gcsafe.},
            abort: proc(e: RtError) {.gcsafe.}) {.gcsafe.} =
-        let parts = payload.strVal.split('\n', maxsplit = 1)
-        assert parts[0] == "https://api.test/submit"
-        assert parts[1] == "{\"data\":1}"
+        check payload.kind == bvRef
+        let data = cast[HttpPostPayload](payload.refVal)
+        check data.url == "https://api.test/submit"
+        check data.body == "{\"data\":1}"
         resume(boxStr("201 Created")))
     let result = run[string](handled)
     check result.isOk
