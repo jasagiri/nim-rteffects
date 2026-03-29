@@ -750,57 +750,36 @@ assert engine.allDone()
 ### Type Erasure: BoxedValue Must Be Unboxed to the Correct Type
 
 `BoxedValue` is a variant object. Calling `unboxInt` on a `bvStr` value will
-access the wrong field. The type contract between the `perform` call site and
-the handler is not enforced by the compiler; it is the programmer's
-responsibility.
+access the wrong field. For `ref object` types, the system performs a runtime
+type check and will raise a `Defect` if you attempt to unbox to the wrong `ref` type.
 
 ```nim
-import rteffects/core
-import rteffects/algebra
-import rteffects/vm/types
-import rteffects/vm/engine
+# Example: Structured data unboxing
+type Config = ref object of RootObj
+  port: int
 
-let tag = EffectTag("fetch")
-
-# perform sends a string payload
-let eff = perform[string](tag, boxStr("https://example.com"))
-  .handle(tag,
-    proc(payload: BoxedValue,
-         resume: proc(v: BoxedValue) {.gcsafe.},
-         abort: proc(e: RtError) {.gcsafe.}) {.gcsafe.} =
-      # Correct: payload is bvStr, so use unboxStr
-      let url = unboxStr(payload)
-      resume(boxStr("response from " & url))
-
-      # Wrong (would access intVal on a bvStr, giving garbage or a crash):
-      #   let n = unboxInt(payload)
+let configTag = EffectTag("config")
+let eff = perform[int](configTag, boxRef(Config(port: 8080)))
+  .handle(configTag,
+    proc(payload: BoxedValue, resume, abort: proc) {.gcsafe.} =
+      # Correct: payload is a Config ref
+      let cfg = cast[Config](unboxRef(payload))
+      resume(boxInt(cfg.port))
   )
-
-let result = run[string](eff)
-assert result.isOk
-assert result.ok == "response from https://example.com"
 ```
 
 Use `boxNone` / `bvNone` when the effect carries no payload and the handler
-ignores it:
+ignores it.
 
-```nim
-import rteffects/core
-import rteffects/algebra
-import rteffects/vm/types
-import rteffects/vm/engine
+---
 
-let yieldTag = EffectTag("yield")
+## 8. Performance and Scalability
 
-let eff = perform[int](yieldTag)  # boxNone() is the default
-  .handle(yieldTag,
-    proc(payload: BoxedValue,
-         resume: proc(v: BoxedValue) {.gcsafe.},
-         abort: proc(e: RtError) {.gcsafe.}) {.gcsafe.} =
-      assert payload.kind == bvNone
-      resume(boxInt(0))
-  )
+RTEffects v2.1.0 uses an event-driven VM engine. Key performance characteristics:
 
-let result = run[int](eff)
-assert result.ok == 0
-```
+- **Constant-time Dispatch**: Frame execution (`runLoop`) uses optimized pending
+  lists. Complexity is O(1) per step regardless of the number of concurrent frames.
+- **Memory Efficiency**: The ready queue uses a `Deque`, ensuring that memory is
+  recycled as frames complete.
+- **Budget Control**: The `budget` parameter in `run` and `interpret` provides
+  deterministic execution limits, returning a `Timeout` error if exceeded.
