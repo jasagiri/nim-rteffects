@@ -1,4 +1,4 @@
-version = "0.2.0"
+version = "0.2.1"
 author = "RTEffects"
 description = "Algebraic effects with Belnap 4-valued paraconsistent logic for Nim"
 license = "Apache-2.0"

@@ -773,7 +773,75 @@ ignores it.
 
 ---
 
-## 8. Performance and Scalability
+## 8. GPU Inference Scheduling Pattern
+
+The `gpu:infer` effect models GPU-bound operations (LLM, VLM, TTS, ASR) as suspendable effects with priority dispatch. This decouples inference submission from execution, enabling:
+
+- **Priority queuing**: user-facing chat preempts background VLM scene analysis
+- **GPU exclusion**: only one inference runs at a time (no Metal contention)
+- **Testability**: mock handlers eliminate GPU dependency in tests
+
+### Priority-Based Dispatch
+
+```nim
+import rteffects
+
+# User-facing (priority 10) — immediate dispatch
+let chatEff = performGpuInfer(GpuInferPayload(
+  kind: "llm", priority: gipUserFacing,
+  requestJson: """{"messages":[{"role":"user","content":"hello"}]}"""))
+
+# Background (priority 0) — yields to higher priority
+let sceneEff = performGpuInfer(GpuInferPayload(
+  kind: "vlm", priority: gipBackground,
+  requestJson: """{"image":"base64..."}"""))
+```
+
+### GPU Scheduler Pattern
+
+A scheduler wraps an `Engine`, maintains a priority queue of suspended frames, and dispatches one at a time:
+
+```nim
+# 1. Submit effects with deferred handler (frames suspend)
+let eng = newEngine(budget = 500)
+let chatFid = eng.newFrame(
+  handle[GpuInferResult](chatEff, gpuInferTag, deferredGpuInferHandler().impl)
+    .program, chatEff.program.entry)
+let sceneFid = eng.newFrame(
+  handle[GpuInferResult](sceneEff, gpuInferTag, deferredGpuInferHandler().impl)
+    .program, sceneEff.program.entry)
+eng.runLoop()  # both suspend
+
+# 2. Scheduler picks highest priority first
+# (gipUserFacing=10 > gipBackground=0)
+eng.resumeFrame(chatFid, boxRef(GpuInferResult(
+  success: true, responseJson: """{"response":"Hi!"}""")))
+eng.runLoop()
+# chatFid is done; sceneFid still suspended
+
+# 3. Then dispatch background work
+eng.resumeFrame(sceneFid, boxRef(GpuInferResult(
+  success: true, responseJson: """{"scene":"room"}""")))
+eng.runLoop()
+# All done
+```
+
+### Chaining GPU Inference with Post-Processing
+
+```nim
+let pipeline = performGpuInfer(GpuInferPayload(
+  kind: "vlm", priority: gipBackground, requestJson: "{}",
+)).map(proc(r: GpuInferResult): string {.gcsafe.} =
+  if r.success: "Scene: " & r.responseJson
+  else: "Error: " & r.error
+)
+```
+
+See `examples/ex18_gpu_inference_scheduling.nim` for a complete runnable demonstration.
+
+---
+
+## 9. Performance and Scalability
 
 RTEffects v0.2.0 uses an event-driven VM engine. Key performance characteristics:
 

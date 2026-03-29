@@ -541,6 +541,83 @@ engine.runLoop()
 
 ---
 
+### GPU Inference
+
+GPU-bound operations (LLM, VLM, TTS, ASR) modeled as effects for priority-based scheduling.
+
+```nim
+const gpuInferTag* = EffectTag("gpu:infer")
+```
+
+#### Types
+
+```nim
+type GpuInferPriority* = enum
+  gipBackground = 0    ## VLM scene description, ambient audio analysis
+  gipNormal = 5        ## standard requests
+  gipUserFacing = 10   ## direct user interaction (chat response)
+
+type GpuInferPayload* = ref object of RootObj
+  kind*: string              ## "llm" | "vlm" | "tts" | "asr"
+  priority*: GpuInferPriority
+  requestJson*: string       ## JSON-serialized inference request
+
+type GpuInferResult* = ref object of RootObj
+  success*: bool
+  responseJson*: string      ## JSON-serialized inference response
+  error*: string             ## error message if !success
+```
+
+#### Perform Wrapper
+
+```nim
+proc performGpuInfer*(payload: GpuInferPayload): Eff[GpuInferResult]
+```
+Request GPU inference. Payload carries the request kind, priority, and serialized request. Resume value: `GpuInferResult`.
+
+#### Mock Handler
+
+```nim
+proc mockGpuInferHandler*(responses: seq[(string, string)]): HandlerEntry
+```
+Returns the response JSON for the first `(kind_substring, responseJson)` pair where `kind_substring` matches `payload.kind`. Aborts if no match.
+
+#### Deferred Handler
+
+```nim
+proc deferredGpuInferHandler*(): HandlerEntry
+```
+Suspends the frame. A GPU scheduler calls `engine.resumeFrame(fid, boxRef(GpuInferResult(...)))` when inference completes. Priority dispatch is the scheduler's responsibility.
+
+#### Usage Example
+
+```nim
+import rteffects
+
+# Testing with mock
+let eff = performGpuInfer(GpuInferPayload(
+  kind: "llm", priority: gipUserFacing,
+  requestJson: """{"messages":[{"role":"user","content":"hello"}]}"""))
+let result = run[GpuInferResult](handle[GpuInferResult](
+  eff, gpuInferTag,
+  mockGpuInferHandler(@[("llm", """{"response":"Hi!"}""")]).impl))
+assert result.ok.success
+
+# Async with deferred handler
+let eng = newEngine(budget = 100)
+let eff2 = handle[GpuInferResult](
+  performGpuInfer(GpuInferPayload(kind: "vlm", priority: gipBackground,
+    requestJson: "{}")),
+  gpuInferTag, deferredGpuInferHandler().impl)
+let fid = eng.newFrame(eff2.program, eff2.program.entry)
+eng.runLoop()
+# ... GPU completes:
+eng.resumeFrame(fid, boxRef(GpuInferResult(success: true, responseJson: "{}")))
+eng.runLoop()
+```
+
+---
+
 ## Async Resume API (Engine)
 
 Import path: `rteffects/vm/engine`
@@ -665,7 +742,7 @@ Allocates a new `Engine` with the given step budget.
 |--------|-------------|------|
 | Core types and error constructors | `rteffects/core` | 1 |
 | Effect algebra (`Eff`, `pure`, `fail`, `andThen`, `map`, `run`, `perform`, `handle`) | `rteffects/algebra` | 1, 2 |
-| Standard handlers (HTTP, File I/O, mock, deferred) | `rteffects/handlers` | 1, 2 |
+| Standard handlers (HTTP, File, GPU, TTS, ASR — sync, mock, deferred) | `rteffects/handlers` | 1, 2 |
 | Four-valued semantics (`Eval`, `TruthValue`, `interpret`) | `rteffects/semantics` | 3 |
 | VM value representation (`BoxedValue`, `EffProgram`, `EffOp`) | `rteffects/vm/types` | 2, 4 |
 | VM execution engine (`Engine`, `Frame`, `resumeFrame`, `abortFrame`) | `rteffects/vm/engine` | 4 |

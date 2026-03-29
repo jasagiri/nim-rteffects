@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.2.1] - 2026-03-29
+
+### Added
+- **GPU Inference Effect** (`gpu:infer`): `GpuInferPayload`, `GpuInferResult`, `GpuInferPriority` for priority-based GPU scheduling.
+- `performGpuInfer`, `deferredGpuInferHandler`, `mockGpuInferHandler` — three handler variants following the standard pattern.
+- Example `ex18_gpu_inference_scheduling.nim` — priority dispatch, deferred/mock usage, effect chaining.
+- Documentation: API reference (GPU Inference section), patterns (GPU Scheduling Pattern, section 8).
+
 ## [0.2.0] - 2026-03-29
 
 ### Added
