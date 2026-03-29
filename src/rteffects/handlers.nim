@@ -37,6 +37,8 @@ const
     ## TTS synthesis. Payload: boxRef(TtsSynthesizePayload). Resume: boxRef(TtsSynthesizeResult).
   asrTranscribeTag* = EffectTag("asr:transcribe")
     ## ASR transcription. Payload: boxRef(AsrTranscribePayload). Resume: boxRef(AsrTranscribeResult).
+  gpuInferTag* = EffectTag("gpu:infer")
+    ## GPU inference. Payload: boxRef(GpuInferPayload). Resume: boxRef(GpuInferResult).
 
 type
   HttpPostPayload* = ref object of RootObj
@@ -68,6 +70,21 @@ type
     text*: string
     language*: string
     duration*: float32
+
+  GpuInferPriority* = enum
+    gipBackground = 0    ## VLM scene description, ambient analysis
+    gipNormal = 5        ## standard requests
+    gipUserFacing = 10   ## direct user interaction
+
+  GpuInferPayload* = ref object of RootObj
+    kind*: string              ## "llm" | "vlm" | "tts" | "asr"
+    priority*: GpuInferPriority
+    requestJson*: string       ## JSON-serialized request
+
+  GpuInferResult* = ref object of RootObj
+    success*: bool
+    responseJson*: string
+    error*: string
 
 # ── Typed Perform Wrappers ─────────────────────────────────────────
 
@@ -105,6 +122,10 @@ proc performAsrTranscribe*(audioData: seq[byte],
   ## Request ASR transcription. Returns text.
   perform[AsrTranscribeResult](asrTranscribeTag, boxRef(AsrTranscribePayload(
     audioData: audioData, language: language)))
+
+proc performGpuInfer*(payload: GpuInferPayload): Eff[GpuInferResult] =
+  ## Request GPU inference. Returns result when GPU becomes available.
+  perform[GpuInferResult](gpuInferTag, boxRef(payload))
 
 # ── Sync Handlers (blocking, for simple scripts) ──────────────────
 
@@ -293,6 +314,16 @@ proc deferredAsrTranscribeHandler*(): HandlerEntry =
       discard
   )
 
+proc deferredGpuInferHandler*(): HandlerEntry =
+  ## Handler that suspends frame for external GPU scheduler.
+  ## Scheduler calls engine.resumeFrame(fid, boxRef(GpuInferResult(...))).
+  HandlerEntry(tag: gpuInferTag, impl: proc(
+    payload: BoxedValue,
+    resume: proc(v: BoxedValue) {.gcsafe.},
+    abort: proc(e: RtError) {.gcsafe.}) {.gcsafe.} =
+      discard  # frame suspends — GPU scheduler resumes later
+  )
+
 proc mockTtsSynthesizeHandler*(audio: seq[byte] = @[],
                                 duration: float32 = 1.0): HandlerEntry =
   ## Mock TTS: immediately resumes with fixed audio.
@@ -321,4 +352,24 @@ proc mockAsrTranscribeHandler*(text: string = "hello",
         resume(boxRef(AsrTranscribeResult(
           text: capturedText, language: capturedLang,
           duration: 1.0)))
+  )
+
+proc mockGpuInferHandler*(responses: seq[(string, string)]): HandlerEntry =
+  ## Mock GPU inference: matches by kind substring, returns response JSON.
+  ## responses: seq of (kind_substring, responseJson).
+  var capturedResponses = responses
+  HandlerEntry(tag: gpuInferTag, impl: proc(
+    payload: BoxedValue,
+    resume: proc(v: BoxedValue) {.gcsafe.},
+    abort: proc(e: RtError) {.gcsafe.}) {.gcsafe.} =
+      {.cast(gcsafe).}:
+        if payload.kind != bvRef or payload.refVal.isNil or not (payload.refVal of GpuInferPayload):
+          abort(exceptionError("GPU infer payload missing or invalid type"))
+          return
+        let data = cast[GpuInferPayload](payload.refVal)
+        for (pattern, respJson) in capturedResponses:
+          if pattern in data.kind:
+            resume(boxRef(GpuInferResult(success: true, responseJson: respJson)))
+            return
+        abort(exceptionError("No mock GPU response for kind: " & data.kind))
   )
