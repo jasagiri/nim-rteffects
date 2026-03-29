@@ -171,7 +171,7 @@ Algebraic effects let a computation declare that it needs something from the out
 
 ### EffectTag and BoxedValue
 
-`EffectTag` is a distinct string that names an effect. `BoxedValue` is a type-erased container used to pass data into and out of effect operations. As of v2.1.0, it supports primitive types and user-defined `ref object` types.
+`EffectTag` is a distinct string that names an effect. `BoxedValue` is a type-erased container used to pass data into and out of effect operations. As of v0.2.0, it supports primitive types and user-defined `ref object` types.
 
 ```nim
 import rteffects/vm/types

@@ -1,6 +1,6 @@
 # Changelog
 
-## [2.1.0] - 2026-03-27
+## [0.2.0] - 2026-03-29
 
 ### Added
 - **Full `ref object` support**: `Eff[T]` now handles user-defined ref types via `boxRef`/`unboxRef`.

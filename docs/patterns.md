@@ -59,7 +59,7 @@ assert result.ok == 42
 
 ### Handlers with Structured Payloads (ref object)
 
-As of v2.1.0, you can pass user-defined `ref object` types through the effect
+As of v0.2.0, you can pass user-defined `ref object` types through the effect
 system. This is the preferred way to handle effects with multiple arguments.
 
 ```nim
@@ -775,7 +775,7 @@ ignores it.
 
 ## 8. Performance and Scalability
 
-RTEffects v2.1.0 uses an event-driven VM engine. Key performance characteristics:
+RTEffects v0.2.0 uses an event-driven VM engine. Key performance characteristics:
 
 - **Constant-time Dispatch**: Frame execution (`runLoop`) uses optimized pending
   lists. Complexity is O(1) per step regardless of the number of concurrent frames.

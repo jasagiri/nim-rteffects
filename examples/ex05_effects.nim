@@ -41,7 +41,7 @@ let result3 = run[int](eff3)
 assert not result3.isOk
 echo "unhandled: ", result3.err.msg  # "unhandled effect: missing"
 
-# --- 4. User-defined ref objects (New in v2.1.0) ---
+# --- 4. User-defined ref objects (New in v0.2.0) ---
 type
   User* = ref object of RootObj
     id*: int
